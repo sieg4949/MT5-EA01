@@ -115,8 +115,8 @@ int    g_spreadCount = 0;                 // 履歴件数
 int g_ma20H1Handle = INVALID_HANDLE;
 int g_ma200H1Handle = INVALID_HANDLE;
 int g_atrH1Handle = INVALID_HANDLE;
-int g_bbUpperHandle = INVALID_HANDLE;
-int g_bbLowerHandle = INVALID_HANDLE;
+// ボリンジャーバンドは単一ハンドルで上限(バッファ0)・下限(バッファ2)を取得する
+int g_bbHandle = INVALID_HANDLE;
 
 // インジケータハンドル（M5）
 int g_ma20M5Handle = INVALID_HANDLE;
@@ -142,8 +142,9 @@ int OnInit()
    g_ma20H1Handle = iMA(_Symbol, PERIOD_H1, 20, 0, MODE_SMA, PRICE_CLOSE);
    g_ma200H1Handle = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_SMA, PRICE_CLOSE);
    g_atrH1Handle = iATR(_Symbol, PERIOD_H1, 14);
-   g_bbUpperHandle = iBands(_Symbol, PERIOD_H1, 20, 2.0, 0, PRICE_CLOSE, MODE_UPPER);
-   g_bbLowerHandle = iBands(_Symbol, PERIOD_H1, 20, 2.0, 0, PRICE_CLOSE, MODE_LOWER);
+   // iBandsはMQL5ではMODE指定不要。6引数で作成し、CopyBufferのバッファ番号で上下を区別する
+   // 第4引数はシフト、第5引数が偏差(Deviation)であるため、順序を誤るとコンパイルエラーになる点に注意
+   g_bbHandle = iBands(_Symbol, PERIOD_H1, 20, 0, 2.0, PRICE_CLOSE);
 
    g_ma20M5Handle = iMA(_Symbol, PERIOD_M5, 20, 0, MODE_SMA, PRICE_CLOSE);
    g_ma50M5Handle = iMA(_Symbol, PERIOD_M5, 50, 0, MODE_SMA, PRICE_CLOSE);
@@ -151,7 +152,7 @@ int OnInit()
 
    // いずれかのハンドルが無効ならエラー終了
    if(g_ma20H1Handle==INVALID_HANDLE || g_ma200H1Handle==INVALID_HANDLE || g_atrH1Handle==INVALID_HANDLE ||
-      g_bbUpperHandle==INVALID_HANDLE || g_bbLowerHandle==INVALID_HANDLE ||
+      g_bbHandle==INVALID_HANDLE ||
       g_ma20M5Handle==INVALID_HANDLE || g_ma50M5Handle==INVALID_HANDLE || g_atrM5Handle==INVALID_HANDLE)
      {
       DebugPrint("インジケータハンドル生成に失敗しました。");
@@ -174,8 +175,8 @@ void OnDeinit(const int reason)
    IndicatorRelease(g_ma20H1Handle);
    IndicatorRelease(g_ma200H1Handle);
    IndicatorRelease(g_atrH1Handle);
-   IndicatorRelease(g_bbUpperHandle);
-   IndicatorRelease(g_bbLowerHandle);
+   // ボリンジャーバンドのハンドルを解放
+   IndicatorRelease(g_bbHandle);
 
    IndicatorRelease(g_ma20M5Handle);
    IndicatorRelease(g_ma50M5Handle);
@@ -276,7 +277,10 @@ double CalcAllowedSpreadPoints()
    double temp[];
    ArrayResize(temp, g_spreadCount);
    ArrayCopy(temp, g_spreadHistory, 0, 0, g_spreadCount);
-   ArraySort(temp, WHOLE_ARRAY, 0, MODE_ASCEND);
+   // MQL5のArraySortは配列のみを引数に取る1引数版で、常に先頭次元を昇順に並べ替える
+   //（MQL4風の開始位置・件数を渡すシグネチャは存在しないため、1引数に揃える）
+   // WHOLE_ARRAY未定義環境でも問題なく動作し、常に全件ソートされることを明示
+   ArraySort(temp);
 
    int index = (int)MathFloor(0.8 * (g_spreadCount - 1));
    double perc80 = temp[index];
@@ -314,6 +318,22 @@ double MinDistancePrice()
   }
 
 //+------------------------------------------------------------------+
+//| ボリューム桁数をステップから算出                                  |
+//| SYMBOL_VOLUME_DIGITSを使わず、stepから安全に桁数を計算する        |
+//+------------------------------------------------------------------+
+int VolumeDigitsFromStep(const double step)
+  {
+   // stepが0以下の場合は2桁にフォールバックし、ゼロ除算やlog計算の失敗を防止
+   if(step <= 0.0)
+      return(2);
+
+   // 例えばstep=0.01なら2桁、0.001なら3桁という具合に桁数を求める
+   double logValue = -MathLog10(step);
+   int digits = (int)MathMax(0.0, MathRound(logValue));
+   return(digits);
+  }
+
+//+------------------------------------------------------------------+
 //| H1のインジケータと価格をまとめて取得                             |
 //+------------------------------------------------------------------+
 bool UpdateH1Context(H1Context &ctx)
@@ -330,8 +350,9 @@ bool UpdateH1Context(H1Context &ctx)
    int copied1 = CopyBuffer(g_ma20H1Handle, 0, 1, 7, ma20);
    int copied2 = CopyBuffer(g_ma200H1Handle, 0, 1, 7, ma200);
    int copied3 = CopyBuffer(g_atrH1Handle, 0, 1, 3, atr);
-   int copied4 = CopyBuffer(g_bbUpperHandle, 0, 1, 3, bbUpper);
-   int copied5 = CopyBuffer(g_bbLowerHandle, 0, 1, 3, bbLower);
+   // ボリンジャーバンド上限はバッファ0、下限はバッファ2を使用する
+   int copied4 = CopyBuffer(g_bbHandle, 0, 1, 3, bbUpper);
+   int copied5 = CopyBuffer(g_bbHandle, 2, 1, 3, bbLower);
 
    if(copied1<7 || copied2<7 || copied3<3 || copied4<3 || copied5<3)
      {
@@ -432,7 +453,8 @@ double CalculateLot(double slDistance)
    if(tickSize <= 0.0)
       return(Inp_FixedLot);
 
-   double riskMoney = AccountBalance() * (Inp_RiskPercent/100.0);
+   // 残高取得はMQL5ネイティブのAccountInfoDoubleを使用し、互換性のないAccountBalance呼び出しを避ける
+   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (Inp_RiskPercent/100.0);
    double valuePerLot = (slDistance / tickSize) * tickValue;
    if(valuePerLot <= 0.0)
       return(Inp_FixedLot);
@@ -443,9 +465,11 @@ double CalculateLot(double slDistance)
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   int volumeDigits = VolumeDigitsFromStep(step);
+   // 桁数はstepから算出することで、ブローカー固有の桁数でも正しく正規化する
    lot = MathMax(minLot, MathMin(maxLot, lot));
    lot = MathFloor(lot/step) * step;
-   lot = NormalizeDouble(lot, (int)SymbolInfoInteger(_Symbol, SYMBOL_VOLUME_DIGITS));
+   lot = NormalizeDouble(lot, volumeDigits);
    return(lot);
   }
 
@@ -454,24 +478,32 @@ double CalculateLot(double slDistance)
 //+------------------------------------------------------------------+
 bool HasOpenPosition()
   {
-   for(int i=0;i<PositionsTotal();++i)
-     {
-      if(!PositionSelectByIndex(i))
-         continue;
-      ulong ticket = PositionGetInteger(POSITION_TICKET);
-      if(PositionGetString(POSITION_SYMBOL)==_Symbol && ticket>0)
-         return(true);
-     }
-   return(false);
+   // MQL5ではシンボル指定のPositionSelectで現在のシンボル保有有無を即判定できる
+   // ・インデックス走査だとプラットフォーム差分でSelectByIndexが利用不可となる場合がある
+   // ・当EAは同一シンボルで同時1ポジションを前提としているため、この単純判定で十分
+   if(!PositionSelect(_Symbol))
+      return(false);
+
+   // PositionSelect成功時のみチケットを取得し、0でなければ保有中と確定する
+   ulong ticket = PositionGetInteger(POSITION_TICKET);
+   return(ticket>0);
   }
 
 bool HasPendingOrder()
   {
+   // MT5ではOrderSelectのオーバーロードが環境差で異なるため、チケット取得→選択の順で安全に走査する
    for(int i=0;i<OrdersTotal();++i)
      {
-      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      // まずチケット番号を取得し、無効な場合はスキップする
+      ulong ticket = OrderGetTicket(i);
+      if(ticket==0)
          continue;
-      ulong ticket = OrderGetInteger(ORDER_TICKET);
+
+      // チケットを指定して選択し、取得できなければ次へ
+      if(!OrderSelect(ticket))
+         continue;
+
+      // シンボル一致かつ有効チケットなら既存指値とみなす
       if(OrderGetString(ORDER_SYMBOL)==_Symbol && ticket>0)
          return(true);
      }
@@ -502,24 +534,21 @@ EntryType ParseEntryType(const string comment)
 //+------------------------------------------------------------------+
 void SyncPositionState()
   {
-   // 既存ポジションがある場合、チケットとコメントから状態を復元
-   for(int i=0;i<PositionsTotal();++i)
+   // シンボル指定でポジションを直接選択し、選択できない場合は状態を初期化する
+   // ・SelectByIndexを使わないことで、インデックス走査が禁止されている環境でも動作を保証
+   // ・単一シンボル運用前提のため、PositionSelect(_Symbol)のみで十分に復元可能
+   if(PositionSelect(_Symbol))
      {
-      if(!PositionSelectByIndex(i))
-         continue;
-      if(PositionGetString(POSITION_SYMBOL)!=_Symbol)
-         continue;
-
+      // 選択成功時はチケット・エントリー時間・コメントを復元し、部分利確/BEフラグも再評価待ちに戻す
       g_positionState.ticket = (long)PositionGetInteger(POSITION_TICKET);
       g_positionState.entryTime = (datetime)PositionGetInteger(POSITION_TIME);
       g_positionState.type = ParseEntryType(PositionGetString(POSITION_COMMENT));
-      // 再起動時は未処理扱いとし、再度MiniTP/BEを判定できるようにする
-      g_positionState.partialDone = false;
-      g_positionState.beDone = false;
+      g_positionState.partialDone = false; // 再起動後にMiniTPを再判定させる
+      g_positionState.beDone = false;      // 再起動後にBE移動を再判定させる
       return;
      }
 
-   // ポジションが無い場合は状態初期化
+   // 選択に失敗（=保有なし）の場合は状態を全て初期化する
    g_positionState.ticket = 0;
    g_positionState.entryTime = 0;
    g_positionState.type = ENTRY_NONE;
@@ -665,18 +694,20 @@ void ManagePosition()
       rValue = (entryPrice - currentPrice) / slDistance;
 
    // 部分利確判定
-   double partialTrigger = (g_positionState.type==ENTRY_CHANNEL) ? Inp_MiniTP_R_BO_Pullback : Inp_MiniTP_R_BO;
-   double partialFrac = (g_positionState.type==ENTRY_CHANNEL) ? Inp_MiniTP_Frac_Pullback : Inp_MiniTP_Frac_BO;
-   if(!g_positionState.partialDone && rValue >= partialTrigger && volume > SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
-     {
-      double closeVolume = volume * partialFrac;
-      closeVolume = MathMax(closeVolume, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
-      closeVolume = NormalizeDouble(closeVolume, (int)SymbolInfoInteger(_Symbol, SYMBOL_VOLUME_DIGITS));
-      if(g_trade.PositionClosePartial(ticket, closeVolume))
-        {
-         DebugPrint(StringFormat("MiniTP発動: ticket=%d, R=%.2f, partial=%.2f", ticket, rValue, closeVolume));
-         g_positionState.partialDone = true;
-        }
+    double partialTrigger = (g_positionState.type==ENTRY_CHANNEL) ? Inp_MiniTP_R_BO_Pullback : Inp_MiniTP_R_BO;
+    double partialFrac = (g_positionState.type==ENTRY_CHANNEL) ? Inp_MiniTP_Frac_Pullback : Inp_MiniTP_Frac_BO;
+    if(!g_positionState.partialDone && rValue >= partialTrigger && volume > SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+      {
+       double closeVolume = volume * partialFrac;
+       closeVolume = MathMax(closeVolume, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+       // ボリューム桁はステップから求めることで、シンボル依存の桁数でも正しく丸める
+       int volumeDigits = VolumeDigitsFromStep(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP));
+       closeVolume = NormalizeDouble(closeVolume, volumeDigits);
+       if(g_trade.PositionClosePartial(ticket, closeVolume))
+         {
+          DebugPrint(StringFormat("MiniTP発動: ticket=%d, R=%.2f, partial=%.2f", ticket, rValue, closeVolume));
+          g_positionState.partialDone = true;
+         }
      }
 
    // 建値移動判定
@@ -690,7 +721,10 @@ void ManagePosition()
 
       // 最低距離を確保してから設定
       double minDist = MinDistancePrice();
-      double basePrice = (direction==POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      // 三項演算子内で改行されないよう1行にまとめ、SYMBOL_ASK/SYMBOL_BIDの識別子が壊れないようにする
+      double basePrice = (direction==POSITION_TYPE_BUY)
+                         ? SymbolInfoDouble(_Symbol, SYMBOL_BID)  // BUYの場合はBid基準
+                         : SymbolInfoDouble(_Symbol, SYMBOL_ASK); // SELLの場合はAsk基準
       if(direction==POSITION_TYPE_BUY && (basePrice - newSL) < minDist)
          newSL = basePrice - minDist;
       if(direction==POSITION_TYPE_SELL && (newSL - basePrice) < minDist)
