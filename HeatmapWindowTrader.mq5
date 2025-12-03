@@ -13,6 +13,26 @@
 //+------------------------------------------------------------------+
 #include <Trade/Trade.mqh>
 
+//--- 互換性確保: MQL4互換コンパイル時のみフィルモード列挙を簡易定義し、
+//--- MQL5環境ではビルトイン定義を使用して再定義エラーを防ぐ
+#ifdef __MQL5__
+  // MQL5ではビルトインを利用するため追加定義は不要
+#else
+  // MQL4互換ビルドで列挙体が存在しない場合のみ最小限を補う
+  #ifndef ENUM_ORDER_TYPE_FILLING
+    enum ENUM_ORDER_TYPE_FILLING
+      {
+       ORDER_FILLING_FOK    = 0,
+       ORDER_FILLING_IOC    = 1,
+       ORDER_FILLING_RETURN = 2
+      };
+  #endif
+  // SYMBOL_FILLING_MODEが未定義な環境ではプロパティ番号を明示しておく
+  #ifndef SYMBOL_FILLING_MODE
+    #define SYMBOL_FILLING_MODE 83
+  #endif
+#endif
+
 //+------------------------------------------------------------------+
 //| 入力パラメータ（仕様書そのままの名称・デフォルト）              |
 //+------------------------------------------------------------------+
@@ -120,8 +140,9 @@ double g_point = 0.0;
 double g_tickSize = 0.0;
 double g_tickValue = 0.0;
 
-double g_stopLevel = 0.0;
-double g_freezeLevel = 0.0;
+// StopLevel/FreezeLevelはポイント単位の整数として保持し、価格換算時に_pointを掛ける
+int g_stopLevel = 0;
+int g_freezeLevel = 0;
 
 // 価格バッファ描画用
 string HM_LINE_NAME = "HM_NEAR_LEVEL";
@@ -228,7 +249,9 @@ bool ComputeRegimeAndATR()
    g_hm.lastH1Time = rates[1].time; // shift=1の時間
 
    // ATR(H1)の取得（保険SLや距離評価で使用）
-   double atrBuf[3];
+   // 動的配列で系列設定し、固定長配列禁止エラーを回避する
+   double atrBuf[];
+   ArrayResize(atrBuf, 3);
    if(CopyBuffer(g_atrH1Handle, 0, 1, 3, atrBuf) < 2)
       return false;
    ArraySetAsSeries(atrBuf, true);
@@ -241,6 +264,9 @@ bool ComputeRegimeAndATR()
 //+------------------------------------------------------------------+
 bool LoadM5Window(int count, MqlRates &out[])
   {
+   // CopyRatesは動的配列を想定するため、事前に必要長へリサイズしておく
+   if(ArraySize(out)!=count)
+      ArrayResize(out, count);
    if(CopyRates(_Symbol, TF_Trigger, 1, count, out) < count-1)
       return false;
    ArraySetAsSeries(out, true);
@@ -458,12 +484,14 @@ bool RebuildHeatmap()
 //+------------------------------------------------------------------+
 //| Edge合成 0-1（入口/出口共通）                                     |
 //+------------------------------------------------------------------+
-double ComputeEdge(bool isBuy)
-  {
-  double emaBuf[5];
-  double atrBuf[5];
-  double rsiBuf[5];
-   ArraySetAsSeries(emaBuf, true); ArraySetAsSeries(atrBuf, true); ArraySetAsSeries(rsiBuf, true);
+  double ComputeEdge(bool isBuy)
+   {
+   // インジケータバッファは動的配列で扱い、コピー後に系列として解釈する
+   double emaBuf[];
+   double atrBuf[];
+   double rsiBuf[];
+   ArrayResize(emaBuf, 5); ArrayResize(atrBuf, 5); ArrayResize(rsiBuf, 5);
+    ArraySetAsSeries(emaBuf, true); ArraySetAsSeries(atrBuf, true); ArraySetAsSeries(rsiBuf, true);
    if(CopyBuffer(g_ma20M5Handle, 0, 1, 5, emaBuf) < 4) return 0.0;
    if(CopyBuffer(g_atrM5Handle, 0, 1, 5, atrBuf) < 4) return 0.0;
    if(CopyBuffer(g_rsi3M5Handle, 0, 1, 5, rsiBuf) < 4) return 0.0;
@@ -486,7 +514,7 @@ double ComputeEdge(bool isBuy)
    double rsiNorm = MathMax(0.0, MathMin(100.0, rsiBuf[1]))/100.0;
 
    // 構造：直近3本の高安パターンを0.5刻みで評価
-   MqlRates m5[5];
+   MqlRates m5[];
    if(!LoadM5Window(5, m5)) return 0.0;
    double structScore = 0.0;
    if(isBuy)
@@ -539,12 +567,14 @@ bool AdjustForStops(const ENUM_ORDER_TYPE orderType, double &price)
 //+------------------------------------------------------------------+
 bool DirectionAvailable(bool isBuy)
   {
+   // ポジションはチケット経由で選択し、MQL4互換コンパイラでも未定義にならない形にする
    int posTotal = PositionsTotal();
    int ordTotal = OrdersTotal();
    int active=0;
    for(int i=0;i<posTotal;i++)
      {
-      if(!PositionSelectByIndex(i)) continue;
+      ulong posTicket = PositionGetTicket(i);          // インデックスからチケットを取得
+      if(posTicket==0 || !PositionSelectByTicket(posTicket)) continue; // 無効ならスキップ
       if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
       if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
       active++;
@@ -552,9 +582,12 @@ bool DirectionAvailable(bool isBuy)
       if((isBuy && t==POSITION_TYPE_BUY) || (!isBuy && t==POSITION_TYPE_SELL))
          return false; // 同方向あり
      }
+
+   // 未約定注文はOrderGetTicketで取り出し、チケット指定の1引数版で選択する
    for(int i=0;i<ordTotal;i++)
      {
-      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      ulong ordTicket = OrderGetTicket(i);
+      if(ordTicket==0 || !OrderSelect(ordTicket)) continue;
       if(OrderGetInteger(ORDER_MAGIC)!=Magic) continue;
       if(OrderGetString(ORDER_SYMBOL)!=_Symbol) continue;
       active++;
@@ -562,6 +595,7 @@ bool DirectionAvailable(bool isBuy)
       if((isBuy && t==ORDER_TYPE_BUY_STOP) || (!isBuy && t==ORDER_TYPE_SELL_STOP))
          return false;
      }
+
    // 同時保有上限
    if(active >= MaxSimultaneousPositions)
       return false;
@@ -579,7 +613,9 @@ double ComputeInsuranceSL(double entryPrice, bool isBuy)
    if(copied<=H1_Pivot_K*2) return 0.0;
    ArraySetAsSeries(h1, true);
 
-   double atrBuf[3];
+   // ATRも動的配列化して系列方向を維持しつつ取得する
+   double atrBuf[];
+   ArrayResize(atrBuf, 3);
    if(CopyBuffer(g_atrH1Handle, 0, 1, 3, atrBuf) < 2) return 0.0;
    ArraySetAsSeries(atrBuf, true);
    double atr = atrBuf[1];
@@ -622,12 +658,21 @@ double ComputeInsuranceSL(double entryPrice, bool isBuy)
 //+------------------------------------------------------------------+
 double CalculateVolume(double entryPrice, double slPrice)
   {
-   double riskAmount = AccountBalance() * (Risk_Percent/100.0);
+   // 口座残高に対するリスク許容量を算出（％表記を小数へ変換）
+   // ※MQL5ではAccountBalance()が未提供のブローカー環境もあるため、
+   //   共通で利用できるAccountInfoDouble(ACCOUNT_BALANCE)を用いて確実に取得する
+   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * (Risk_Percent/100.0);
+
+   // エントリー価格とSL価格の距離を求め、ゼロ除算を防ぐ
    double stopDist = MathAbs(entryPrice - slPrice);
    if(stopDist<=0.0 || g_tickValue<=0.0 || g_tickSize<=0.0)
       return Lots_Min;
+
+   // 1ロットあたりのリスク金額をティック単位で計算
    double riskPerLot = (stopDist / g_tickSize) * g_tickValue;
    if(riskPerLot<=0.0) return Lots_Min;
+
+   // リスク許容量から理論ロットを逆算
    double vol = riskAmount / riskPerLot;
 
    // ブローカーのVolume制約に合わせて丸め
@@ -667,23 +712,72 @@ bool PlacePending(const bool isBuyStop, double price, double sl, const string re
       return false;
      }
 
-   g_trade.SetExpertMagicNumber(Magic);
-   g_trade.SetDeviationInPoints(20);
+    g_trade.SetExpertMagicNumber(Magic);
+    g_trade.SetDeviationInPoints(20);
 
-   bool sent = g_trade.OrderSend(_Symbol, type, volume, price, 0, sl, 0, reason);
-   if(!sent)
+    // MqlTradeRequestを明示的に構築し、Trade.mqhの要求する2引数シグネチャに合わせる
+    MqlTradeRequest req;
+    MqlTradeResult  res;
+    ZeroMemory(req);
+    ZeroMemory(res);
+    req.action      = TRADE_ACTION_PENDING;
+    req.symbol      = _Symbol;
+    req.type        = type;
+    req.volume      = volume;
+    req.price       = price;
+    req.sl          = sl;
+    req.tp          = 0.0;
+    req.magic       = Magic;
+    req.deviation   = 20;
+    req.comment     = reason;
+    req.type_time   = ORDER_TIME_GTC;
+   // 許容されるフィルモードを優先的に使い、返されるまで待つ設定を基本とする
+   // ※ コンパイラ環境によって取得APIが異なるため、MQL5と互換ビルドで分岐して安全に扱う
+#ifdef __MQL5__
+   // --- MQL5: 参照渡し版を利用し、取得失敗時は安全側に丸める
+   long fillModeRaw = 0;
+   ENUM_ORDER_TYPE_FILLING fillModeEnum = ORDER_FILLING_RETURN; // 安全側デフォルト
+
+   // MQL5標準の参照渡し版でフィルモードを取得
+   if(SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE, fillModeRaw))
      {
-      int rc = g_trade.ResultRetcode();
-      LogPrint(StringFormat("OrderSend失敗(%d) 再試行: %s", rc, reason));
-      ResetLastError();
-      sent = g_trade.OrderSend(_Symbol, type, volume, price, 0, sl, 0, reason);
-      if(!sent)
-        {
-         rc = g_trade.ResultRetcode();
-         LogPrint(StringFormat("OrderSend再試行も失敗(%d): %s", rc, reason));
-         return false;
-        }
+      // 数値を列挙体へ安全にキャストし、意味のある値だけを採用する
+      fillModeEnum = (ENUM_ORDER_TYPE_FILLING)fillModeRaw;
+
+      // ブローカーの許容値のみを採用し、それ以外はRETURNへ丸める
+      if(!(fillModeEnum==ORDER_FILLING_FOK || fillModeEnum==ORDER_FILLING_IOC || fillModeEnum==ORDER_FILLING_RETURN))
+         fillModeEnum = ORDER_FILLING_RETURN;
      }
+
+   // 取得失敗時も含め、最終的に決定した値をリクエストへ設定
+   req.type_filling = fillModeEnum;
+#else
+   // --- MQL4互換: 戻り値版のSymbolInfoIntegerのみ利用できるケースを想定
+   // 取得できない場合でもORDER_FILLING_RETURNを採用することで互換性を確保する
+   long fillModeRaw = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   int fillModeEnum = (int)fillModeRaw;
+   if(!(fillModeEnum==ORDER_FILLING_FOK || fillModeEnum==ORDER_FILLING_IOC || fillModeEnum==ORDER_FILLING_RETURN))
+      fillModeEnum = ORDER_FILLING_RETURN;
+
+   // MqlTradeRequestのtype_fillingは整数でも受け付けられるため、そのまま設定
+   req.type_filling = fillModeEnum;
+#endif
+
+    bool sent = g_trade.OrderSend(req, res);
+    if(!sent)
+      {
+       uint rc = res.retcode;
+       LogPrint(StringFormat("OrderSend失敗(%d) 再試行: %s", rc, reason));
+       ResetLastError();
+       ZeroMemory(res);
+       sent = g_trade.OrderSend(req, res);
+       if(!sent)
+         {
+          rc = res.retcode;
+          LogPrint(StringFormat("OrderSend再試行も失敗(%d): %s", rc, reason));
+          return false;
+         }
+      }
 
    LogPrint(StringFormat("逆指値セット %s 価格=%.5f SL=%.5f Vol=%.2f Edge/BandScore=%.2f/%.2f", isBuyStop?"BUY STOP":"SELL STOP", price, sl, volume, ComputeEdge(isBuyStop), g_hm.nearScore));
 
@@ -756,7 +850,9 @@ void TryEntryOnM5()
    if(!SpreadOK())
       return;
 
-   double atrM5Buf[10];
+   // ATR(M5)も動的配列で確保し、可変長パラメータにも安全に対応する
+   double atrM5Buf[];
+   ArrayResize(atrM5Buf, SwingLB_M5+2);
    if(CopyBuffer(g_atrM5Handle, 0, 1, SwingLB_M5+2, atrM5Buf) < SwingLB_M5)
       return;
    ArraySetAsSeries(atrM5Buf, true);
@@ -840,12 +936,14 @@ void TryEntryOnM5()
 //+------------------------------------------------------------------+
 void CheckExitOnM5()
   {
-   int posTotal = PositionsTotal();
-   for(int i=0;i<posTotal;i++)
-     {
-      if(!PositionSelectByIndex(i)) continue;
-      if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
-      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+    int posTotal = PositionsTotal();
+    for(int i=0;i<posTotal;i++)
+      {
+       // インデックスからチケットを取得し、チケット指定の選択で安全にアクセス
+       ulong posTicket = PositionGetTicket(i);
+       if(posTicket==0 || !PositionSelectByTicket(posTicket)) continue;
+       if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+       if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
 
       ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
       bool isBuy = (type==POSITION_TYPE_BUY);
@@ -853,8 +951,9 @@ void CheckExitOnM5()
       double sl    = PositionGetDouble(POSITION_SL);
 
       // 構造チェック（LL→LL or HH→HH）
-      MqlRates m5[5];
-      if(!LoadM5Window(5, m5)) continue;
+     // Exit判定でも動的配列を使用し、系列設定可能な形でウィンドウを取得
+     MqlRates m5[];
+     if(!LoadM5Window(5, m5)) continue;
       bool structExit=false;
       if(isBuy)
         structExit = (m5[1].low < m5[2].low && m5[2].low < m5[3].low);
@@ -872,8 +971,9 @@ void CheckExitOnM5()
         }
 
       // BURST：RSI差分と3連続高安
-      double rsiBuf[4];
-      ArraySetAsSeries(rsiBuf, true);
+     double rsiBuf[];
+     ArrayResize(rsiBuf, 4);
+     ArraySetAsSeries(rsiBuf, true);
       if(CopyBuffer(g_rsi3M5Handle, 0, 1, 4, rsiBuf) < 3) continue;
       double delta = rsiBuf[1]-rsiBuf[2];
       bool burst=false;
@@ -895,8 +995,9 @@ void CheckExitOnM5()
       // EDGE：2本連続でEdgeが閾値未満
       double edge1 = ComputeEdge(isBuy);
       // 1本前のEdgeを近似するためEMA/RSIをshift=2で再計算
-      double emaBuf[5]; double atrBuf[5]; double rsiBuf2[5];
-      ArraySetAsSeries(emaBuf, true); ArraySetAsSeries(atrBuf, true); ArraySetAsSeries(rsiBuf2, true);
+    double emaBuf[]; double atrBuf[]; double rsiBuf2[];
+    ArrayResize(emaBuf, 5); ArrayResize(atrBuf, 5); ArrayResize(rsiBuf2, 5);
+    ArraySetAsSeries(emaBuf, true); ArraySetAsSeries(atrBuf, true); ArraySetAsSeries(rsiBuf2, true);
       if(CopyBuffer(g_ma20M5Handle, 0, 2, 5, emaBuf) < 4) continue;
       if(CopyBuffer(g_atrM5Handle, 0, 2, 5, atrBuf) < 4) continue;
       if(CopyBuffer(g_rsi3M5Handle, 0, 2, 5, rsiBuf2) < 4) continue;
@@ -964,8 +1065,9 @@ int OnInit()
    g_point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    g_tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    g_tickValue= SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   g_stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   g_freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+    // ブローカー設定はlongで返るため明示的にintへキャストし、ポイント換算は使用時に行う
+    g_stopLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    g_freezeLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
 
    g_atrH1Handle = iATR(_Symbol, TF_Context, ATR_H1_Period);
    g_atrM5Handle = iATR(_Symbol, TF_Trigger, ATR_H1_Period);
