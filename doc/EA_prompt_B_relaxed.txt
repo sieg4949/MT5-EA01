@@ -1,0 +1,256 @@
+最終EAプロンプト（MQL5向け／“ヒートマップ窓”×B優先EXIT：STRUCT緩和＋時間切れなし／H1文脈＋M5執行）
+================================================================================
+
+あなたは MetaTrader 5（MT5）用 Expert Advisor を実装するプロの MQL5 エンジニアです。
+以下仕様に**完全準拠**し、**コンパイルエラー/警告ゼロ**の **単一 .mq5** を出力してください。
+**MQL4関数は禁止**、**外部インクルード・カスタムインジ不要**。**説明文は不要、コードのみ出力**してください。
+（コード内コメントは十分に詳しく入れてください／すべて日本語コメントで詳細に）
+
+
+# 0) 目的と全体像（要約）
+- H1で「文脈（レジーム）」と「価格帯ヒートマップ（A+B+D）」を構築し、
+  価格が“強い帯”に接近した時だけ **イベント窓** を開く。
+- M5では、窓が開いている間に「TRD=順張りブレイクアウト / RNG=逆張りリバーサル」で**逆指値**をセット。
+- 約定後のEXITは **B優先（STRUCT > BURST > EDGE）**。ただし **STRUCTは緩和版（反対側2段のみ）**。
+- **時間切れEXITは存在しない（MaxBars概念を削除）**。
+- 初期SLは「H1スイング＋ATR(H1)を基準にした**保険SL**」。
+
+
+# 1) ベース要件
+- `#property strict` を先頭に宣言。
+- 主要イベント：`OnInit`, `OnDeinit`, `OnTick`。
+- 取引は `CTrade`（`#include <Trade/Trade.mqh>`）を使用。
+- **確定足のみ**で判定：
+  - H1の判定・帯計算は **H1の確定足（shift=1）**
+  - M5のトリガー・約定判定も **M5の確定足（shift=1）**
+- マルチタイム：
+  - **H1＝文脈＆帯（ヒートマップ）生成だけ**
+  - **M5＝窓管理・注文・決済（発注＆EXIT）**
+
+
+# 2) 入力パラメータ（Inputs）とデフォルト
+// 一般
+input double   Risk_Percent             = 1.0;      // 1トレードの証拠金％（ロット算出に使用）
+input double   Lots_Min                 = 0.01;
+input double   Lots_Max                 = 10.0;
+input int      Magic                    = 260915;
+
+// タイムフレーム（固定想定だが可変にしておく）
+input ENUM_TIMEFRAMES TF_Context        = PERIOD_H1;   // 文脈＝H1
+input ENUM_TIMEFRAMES TF_Trigger        = PERIOD_M5;   // 執行＝M5
+
+// H1 文脈・レジーム判定（回帰傾きベース）
+input int      H1_Reg_Span              = 48;          // 回帰に使う本数（H1）
+input double   H1_Reg_StdCoeff          = 0.002;       // しきい値 = Std(close)*係数
+input int      ATR_H1_Period            = 14;
+
+// Heatmap（A+B+D：スイング/前日高安・当日始値/日VWAP＋H1累積VWAP）
+input int      HM_Lookback_M5           = 120;         // バケット構築のM5本数（直近）
+input double   HM_Bucket_Pips           = 2.0;         // バケット幅（pips）
+input int      HM_Weight_A              = 30;          // A：スイング極値の投票重み
+input int      HM_Weight_B              = 20;          // B：前日高安/当日始値の投票重み
+input int      HM_Weight_D              = 50;          // D：日VWAP/H1累積VWAPの投票重み
+input double   HM_Score_Threshold       = 58.0;        // 採用スコア閾値（0-100）
+
+// イベント窓（H1距離基準）
+input double   EnterTol_H1ATR           = 0.45;        // 価格と帯の距離が ATR(H1)×この係数以下で窓OPEN
+input double   ExitTol_H1ATR            = 0.65;        // 離れがこの係数以上で窓CLOSE
+input int      Window_TTL_M5            = 24;          // 窓の寿命（M5本数）
+input int      Refire_Cooldown_M5       = 5;           // 窓終了後のクールダウン（M5本）
+
+// M5エントリ（TRD=ブレイクアウト／RNG=リバーサル）
+input int      SwingLB_M5               = 6;           // 直近高安探索本数（発注価格計算に使用）
+input double   EntryBuffer_ATR_M5       = 0.12;        // 逆指値バッファ=ATR(M5)*係数（TRD側）
+input double   EntryBuffer_RV_ATR_M5    = 0.10;        // RNG側の逆指値バッファ=ATR(M5)*係数
+input int      MA20_M5_Period           = 20;          // Edge算出で使用（位置/傾きなど）
+
+// エントリ許容（Edge）
+input double   Edge_Entry_Min           = 0.60;        // 0-1正規化の合成Edgeがこの値以上で発注許可
+
+// EXIT（B優先：STRUCT > BURST > EDGE）
+input int      RSI3_Period              = 3;           // RSI短期
+input double   Burst_Delta              = 14.0;        // |ΔRSI(3)| しきい値（逆向き急転）
+input double   Edge_Exit_Thresh         = 0.30;        // Edgeが2本連続でこの値未満でEXIT
+
+// 損益管理（保険SL）
+input int      H1_Pivot_K               = 3;           // H1スイング検出の左右K
+input double   SL_Extra_ATR_H1          = 0.20;        // スイング基準に追加する余裕（ATR(H1)*係数）
+
+// フィルタ
+input bool     Use_SpreadFilter         = true;
+input double   MaxSpread_Points         = 25;          // スプレッド上限（ポイント）
+
+// リスク制御
+input int      MaxSimultaneousPositions = 1;           // 同時保有上限
+input bool     OneShotPerWindow         = true;        // 1回発注で窓を閉じる
+
+// ログ/描画
+input bool     Enable_Log               = true;
+input bool     Plot_Buffers             = true;
+
+
+# 3) データの取得と前処理（MQL5標準）
+- すべて「MQL5純正関数」で実装：`iATR`, `iMA`, `CopyBuffer`, `CopyRates` 等。
+- H1の系列は **H1チャートから直接**取得（M5からの再サンプリング禁止）。
+- **shift=1（確定足）** 徹底。
+- Point/Digits/TickSize を取得し、価格正規化・丸めは**必ず**行う。
+
+
+# 4) H1文脈：レジーム判定（TRD or RNG）
+- H1終値の直近 `H1_Reg_Span` 本に対して、単回帰の傾き `beta` を算出。
+  - `x = [0..span-1]`, `y = close`
+  - `beta = cov(x,y) / var(x)`（詳細式はコード内コメントで明記）
+- しきい値 = `StdDev(y) * H1_Reg_StdCoeff`
+- `abs(beta) >= しきい値` なら **TRD**（トレンド）、そうでなければ **RNG**（レンジ）。
+- この判定は **H1確定時のみ**更新（パフォーマンス最適化）。
+
+
+# 5) Heatmap（A+B+D）で“強い帯”を構築（H1確定時のみ再計算）
+- M5の直近 `HM_Lookback_M5` 本の **高値最小値～安値最大値** をレンジとし、
+  `HM_Bucket_Pips` pipsごとにバケツ分割。
+- A：M5スイング極値（左右=3固定でOK）で投票（そのバケツ+1）。
+- B：前日高値・前日安値・当日始値（M5→1Dリサンプリング）で投票（各+1）。
+- D：**日内VWAP**（当日内の累積）と **H1累積VWAP**（全期間累積）の**直近値**に投票（各+1）。
+- A/B/D をそれぞれ重み `HM_Weight_A/B/D` で線形合成 → **0-100** へ線形正規化。
+- **Near帯の抽出**：スコア上位（最大16）のうち、**現在値に最も近い帯**を 1 つ選ぶ。
+
+
+# 6) イベント窓（H1距離基準）
+- `price = Close(M5, shift=1)`、`level = Near帯の価格`、`atrH1 = ATR(H1, ATR_H1_Period, shift=1)`。
+- **窓OPEN**：`abs(price - level) <= EnterTol_H1ATR * atrH1` かつ `Score >= HM_Score_Threshold`、
+  さらにクールダウン中でないこと（`cooldown==0`）。
+  - 窓の方向 `side` は `level >= price` なら **UP**、そうでなければ **DOWN**。
+  - `TTL = Window_TTL_M5` に初期化。
+- **窓CLOSE**：`abs(price - level) >= ExitTol_H1ATR * atrH1` または TTL切れ。
+  - `OneShotPerWindow=true` の場合、**約定/注文直後に即CLOSE**。
+- **Refire**：CLOSE後は `Refire_Cooldown_M5` 本のクールダウン。
+
+
+# 7) M5エントリ（窓がOPEN中にのみ判定）
+- TRD（H1=TRD）時：
+  - side=UP：`entry = Max(High[1..SwingLB_M5]) + EntryBuffer_ATR_M5 * ATR(M5)` の **BUY STOP**
+  - side=DOWN：`entry = Min(Low[1..SwingLB_M5]) - EntryBuffer_ATR_M5 * ATR(M5)` の **SELL STOP**
+- RNG（H1=RNG）時：
+  - side=UP：`entry = Min(Low[1..SwingLB_M5]) - EntryBuffer_RV_ATR_M5 * ATR(M5)` の **SELL STOP**
+  - side=DOWN：`entry = Max(High[1..SwingLB_M5]) + EntryBuffer_RV_ATR_M5 * ATR(M5)` の **BUY STOP**
+- **Edge（入口）**：0-1合成（後述）が `Edge_Entry_Min` 以上でのみ発注許可。
+- **スプレッド／StopLevel**：
+  - `(Ask-Bid)/_Point <= MaxSpread_Points` を満たすときのみ。
+  - `SYMBOL_TRADE_STOPS_LEVEL`/`FREEZELEVEL` を満たせない場合は、逆指値価格を**安全側に拡張**して再判定。
+  - なお満たせない場合は**スキップ**。
+- **ロット**：`Risk_Percent` と初期SL距離（後述）から計算し、`Lots_Min～Lots_Max` に丸め。
+
+
+# 8) Edge（0-1合成）の定義（入口判定＆出口ヒステリシス用）
+- **位置**：`pos = normalize( (Close - EMA20) / (2*ATR_M5) )` → [-1,1]→[0,1]
+- **傾き**：`slope = normalize( (EMA20-EMA20[3]) / (3*ATR_M5) )` → [-1,1]→[0,1]
+- **RSI**：`RSI(3)` を 0-100→0-1 へ（飽和・安全化）
+- **構造（瞬時）**：
+  - LONG側：`High[1] > max(High[2],High[3])` かつ `Low[1]` は `Low[2..3]` 未満でない → up構造=1（両方なら0.5）
+  - SHORT側は逆
+- **重み**：`[位置0.35, 傾き0.25, RSI0.25, 構造0.15]` を線形合成 → **Edge ∈ [0,1]**
+
+
+# 9) 逆指値の発注フロー（OneShotPerWindow対応）
+- 条件を満たしたら `CTrade::OrderSend()` で逆指値をセット。
+- `OneShotPerWindow=true` の場合、**注文成功直後に窓をCLOSEし、クールダウン開始**。
+- 既存ポジション/注文が `MaxSimultaneousPositions` に達している場合は**新規禁止**。
+- **重複方向の抑制**：同方向のオーダー/ポジがある場合は新規発注しない。
+
+
+# 10) 初期SL（保険SL）の設定
+- 約定時に1回だけ算出してセット（計算負荷を抑える）
+- H1のスイング（左右K=`H1_Pivot_K`）で、**遠目側**の直近高安を探索：
+  - BUY：約定価格より下の直近**安値**スイング（最大5個を後方探索）。見つからない場合は `Entry - 2.5*ATR(H1)`。
+  - SELL：約定価格より上の直近**高値**スイング（同様）。見つからない場合は `Entry + 2.5*ATR(H1)`。
+- さらに `SL_Extra_ATR_H1 * ATR(H1)` を**余裕**として外側に追加（BUYは下へ、SELLは上へ）。
+- `SYMBOL_TRADE_STOPS_LEVEL` を満たすよう価格は正規化・補正。
+
+
+# 11) EXIT（B優先：STRUCT > BURST > EDGE）※時間切れは**無し**
+- **STRUCT（最優先／緩和版）**：
+  - BUY保有中：`Low[1] < Low[2] < Low[3]`（= **LL→LL**）で**即**クローズ
+  - SELL保有中：`High[1] > High[2] > High[3]`（= **HH→HH**）で**即**クローズ
+  - ※ 旧要件の「HHの失速/LLの失速」は**条件から削除**（早降りを抑制）
+- **BURST（次優先）**：
+  - BUY保有中：`Low` が 3連続で切り下がり、かつ `ΔRSI(3) <= -Burst_Delta` でクローズ
+  - SELL保有中：`High` が 3連続で切り上がり、かつ `ΔRSI(3) >= +Burst_Delta` でクローズ
+- **EDGE（最後）**：
+  - 合成Edgeが **2本連続**で `Edge_Exit_Thresh` を下回ったらクローズ（ヒステリシス設計）
+- **保険SL**：
+  - 上記より先にSLヒットした場合はSLでクローズ。
+- **時間切れ（MaxBars）**：
+  - **存在しない**（概念を削除）
+
+
+# 12) ロット計算と価格正規化
+- `Risk_Percent`、口座情報（FreeMargin、ContractSize 等）と初期SL距離からロットを算出。
+- `SYMBOL_VOLUME_MIN/MAX/STEP` を考慮し、`Lots_Min～Lots_Max` 範囲に丸め。
+- すべての価格は `Digits`/`TickSize` に合わせて正規化（`SymbolInfoDouble` を使用）。
+
+
+# 13) ログと描画（バックテスト検証補助）
+- `Enable_Log=true` のとき `Print()`：
+  - 窓OPEN/CLOSE（帯レベル/距離/ATR/スコア/方向 side/TTL）
+  - 逆指値セット（種別TRD/RNG、価格、Edge、Spread、StopLevel補正）
+  - 約定・SL設定（基準スイング、ATR(H1)、最終SL価格）
+  - EXIT（STRUCT/BURST/EDGE/SL、それぞれの理由、R値）
+- `Plot_Buffers=true` のとき：
+  - 直近の **Near帯レベル** を M5上に水平ラインで投影（色区別）
+  - 窓OPEN中は背景に薄い矩形を描画（TTLでフェード）
+  - H1累積VWAP/日VWAPの最新値ラインを薄色で補助表示（任意実装でOK）
+
+
+# 14) OnDeinitでの集計出力（バックテスト向け）
+- 総トレード数、勝率、合計R、平均R、最大DD（R）、理由内訳（STRUCT/BURST/EDGE/SL件数）を `Print`。
+- マジックナンバー・シンボル・タイムフレームを併記し、識別可能に。
+
+
+# 15) エラー・堅牢化
+- `CTrade::ResultRetcode()` をチェック、失敗時は内容をログ出力し、**1回のみ再試行**。
+- `SYMBOL_TRADE_MODE` を確認し、取引不可なら即Return。
+- 逆指値価格が StopLevel/FreezeLevel を満たせない場合は **安全側に価格を再計算**。
+- 同方向の重複発注を防止（注文・ポジションのスキャン）。
+- 価格系列の欠損や休日は静観（計算できない場合は何もしない）。
+
+
+# 16) 実装のポイント（重要）
+- すべての判定は **確定足（shift=1）** のデータのみで行う。
+- H1の再計算（Heatmap/Regime）は **H1足が確定したときだけ**行い、M5側では**キャッシュ**を参照する。
+- 入口のEdge合成は**M5確定時**に計算し、**入口判定**と**出口ヒステリシス**で共用。
+- **時間切れEXITは実装しないこと**（MaxBars概念は**完全削除**）。
+- **STRUCTは緩和版**（BUY=LL→LL、SELL=HH→HHのみ）。
+
+
+# 17) 検算に使うデフォルト（参考）
+- `EnterTol_H1ATR=0.45, ExitTol_H1ATR=0.65, HM_Score_Threshold=58`
+- `SwingLB_M5=6, EntryBuffer_ATR_M5=0.12, EntryBuffer_RV_ATR_M5=0.10`
+- `MA20_M5_Period=20, Edge_Entry_Min=0.60, Edge_Exit_Thresh=0.30`
+- `Burst_Delta=14, ATR_H1_Period=14, H1_Pivot_K=3, SL_Extra_ATR_H1=0.20`
+- `Window_TTL_M5=24, Refire_Cooldown_M5=5`
+- `HM_Lookback_M5=120, HM_Bucket_Pips=2.0, Weights(A,B,D)=(30,20,50)`
+
+
+# 18) 出力形式
+- **単一 .mq5 ファイル**を出力（コードのみ／コメントは日本語で詳細に）。
+- 依存インクルードは `#include <Trade/Trade.mqh>` のみ許可。
+- それ以外の外部ファイル・カスタム指標は使用禁止。
+
+
+# 19) テスト想定
+- シンボル：USDJPY、M5チャート上で稼働（H1は内部で取得）。
+- スプレッドは `MaxSpread_Points` を超える時間帯は新規禁止（保有は継続管理）。
+- 1ポジ限定、OneShotPerWindowで“窓から1回だけ”。
+
+
+# 20) 付記（EA内部コメントで示すこと）
+- 主要ロジックの算式・根拠（回帰傾き、Edge合成、STRUCT/BURST/EDGEの具体条件）
+- 価格正規化の根拠（TickSize/Digits）
+- StopLevel/FreezeLevelの扱い
+- ヒートマップの各スコアの意味とウェイト
+- 緩和版STRUCTの意図（“早降り抑制・利伸び重視”）
+
+
+以上の仕様に**厳密に従い**、**MQL5専用**で**コンパイル/警告ゼロ**になるよう、
+**読みやすくセクションコメントを豊富に付けた .mq5 を単一ファイルで出力**してください。
+（このテキストはEA生成の**完全仕様**です。省略や独自解釈は不可）
