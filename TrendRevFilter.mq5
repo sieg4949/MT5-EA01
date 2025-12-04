@@ -11,7 +11,7 @@
 //+------------------------------------------------------------------+
 #property strict
 #property description "Trend-Following with Reverse Veto Filter (H1 context / M1 trade)"
-#property version   "1.0.0"
+#property version   "1.00"          // MQL5 Marketのバージョン表記規約に合わせて「xxx.yy」形式へ修正
 #property link      ""
 
 // 標準ライブラリ
@@ -90,6 +90,11 @@ CTrade trade;
 
 MqlTick last_tick;
 datetime last_bar_time = 0;
+
+// 「NAN」相当の値を明示的に用意（ビルド環境で未定義だったため自前で保持）
+//  ※コンパイル時定数で0除算を行うと「0.0 - division by zero」エラーになるため、
+//    実行時に安全な計算でNaNを生成しグローバルに保持する。
+double NaNValue = 0.0;             // OnInitでMathSqrt(-1.0)を使ってNaNへ差し替える
 
 int DigitsAdjust = 1;           // USDJPYなどを想定（1pips=0.01）
 double PointPips = 0.01;        // 1pips相当
@@ -173,7 +178,7 @@ bool ZScore(double &z, ENUM_TIMEFRAMES tf, int period, int shift_base=1)
 double GetRSI(ENUM_TIMEFRAMES tf, int period, int shift)
 {
    double buf[];
-   if(CopyBuffer(iRSI(_Symbol, tf, period, PRICE_CLOSE), 0, shift, 2, buf) != 2) return NAN;
+   if(CopyBuffer(iRSI(_Symbol, tf, period, PRICE_CLOSE), 0, shift, 2, buf) != 2) return NaNValue; // 取得失敗時はNaNを返し、後続ロジックで除外する
    return(buf[1]); // shiftのバーの値（確定足基準）
 }
 
@@ -181,7 +186,7 @@ double GetRSI(ENUM_TIMEFRAMES tf, int period, int shift)
 double GetEMA(ENUM_TIMEFRAMES tf, int period, int shift)
 {
    double buf[];
-   if(CopyBuffer(iMA(_Symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE), 0, shift, 2, buf) != 2) return NAN;
+   if(CopyBuffer(iMA(_Symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE), 0, shift, 2, buf) != 2) return NaNValue; // 失敗時はNaNで異常を通知
    return buf[1];
 }
 
@@ -189,7 +194,7 @@ double GetEMA(ENUM_TIMEFRAMES tf, int period, int shift)
 double GetATR(ENUM_TIMEFRAMES tf, int period, int shift)
 {
    double buf[];
-   if(CopyBuffer(iATR(_Symbol, tf, period), 0, shift, 2, buf) != 2) return NAN;
+   if(CopyBuffer(iATR(_Symbol, tf, period), 0, shift, 2, buf) != 2) return NaNValue; // 失敗時はNaNを返却
    return buf[1];
 }
 
@@ -197,7 +202,7 @@ double GetATR(ENUM_TIMEFRAMES tf, int period, int shift)
 double GetADX(ENUM_TIMEFRAMES tf, int period, int shift)
 {
    double buf[];
-   if(CopyBuffer(iADX(_Symbol, tf, period), 0, shift, 2, buf) != 2) return NAN;
+   if(CopyBuffer(iADX(_Symbol, tf, period), 0, shift, 2, buf) != 2) return NaNValue; // 失敗時はNaNを返却
    return buf[1];
 }
 
@@ -206,7 +211,7 @@ double GetMACDHist(ENUM_TIMEFRAMES tf, int fast, int slow, int signal, int shift
 {
    // バッファ2=MACDヒスト（MetaTraderのiMACD仕様）
    double buf[];
-   if(CopyBuffer(iMACD(_Symbol, tf, fast, slow, signal, PRICE_CLOSE), 2, shift, 2, buf) != 2) return NAN;
+   if(CopyBuffer(iMACD(_Symbol, tf, fast, slow, signal, PRICE_CLOSE), 2, shift, 2, buf) != 2) return NaNValue; // 取得失敗時のNaN返却で安全に処理を抜ける
    return buf[1];
 }
 
@@ -290,7 +295,9 @@ void ReverseScores(int &revBuy, int &revSell)
 
    // 必要な値を収集（すべて shift=1＝確定バー）
    double cOpen, cHigh, cLow, cClose;
-   MqlRates r[3];
+   // 静的配列ではArraySetAsSeriesが利用できないため動的配列に変更し、
+   // 足方向を確定足基準（series=true）へ揃えて参照ミスを防止する
+   MqlRates r[];
    if(CopyRates(_Symbol, TF_Trade, 0, 3, r) < 3) return;
    ArraySetAsSeries(r, true);
    cOpen  = r[1].open;
@@ -361,10 +368,11 @@ int EntryScore(double &buyGate, double &sellGate)
    if( r2 >= R2_GATE && slope < 0 && MathAbs(slope) >= H1_Slope_Min ) sellGate= true;
 
    // ---- M1 近接データ（確定足）----
-   MqlRates rt[ZLong_Period+5];
+   // 入力値に依存する可変長サイズのため、動的配列で安全に確保（静的配列ではビルドエラーになるため）
+   MqlRates rt[];
    int need = MathMax(MathMax(Donchian_Period+2, ZLong_Period+2), CLV_Sum_Period+2) + 5;
-   if(CopyRates(_Symbol, TF_Trade, 0, need, rt) < need) return 0;
-   ArraySetAsSeries(rt, true);
+   if(CopyRates(_Symbol, TF_Trade, 0, need, rt) < need) return 0; // 必要本数取れなければ評価不能
+   ArraySetAsSeries(rt, true); // シリーズ方向を反転させ、インデックスを確定足基準で扱いやすくする
 
    double close1 = rt[1].close;
    double open1  = rt[1].open;
@@ -450,10 +458,11 @@ int ExitScore(int dir)
    double rsi1   = GetRSI(TF_Trade, RSI_Period, 1);
    double macdh1 = GetMACDHist(TF_Trade, MACD_Fast, MACD_Slow, MACD_Signal, 1);
 
-   MqlRates r[ZLong_Period+5];
+   // ZLong_Periodに応じて本数が変わるため動的配列で取得（静的配列では定数式が必要なためエラーとなる）
+   MqlRates r[];
    int need = ZLong_Period + 5;
-   if(CopyRates(_Symbol, TF_Trade, 0, need, r) < need) return 0;
-   ArraySetAsSeries(r, true);
+   if(CopyRates(_Symbol, TF_Trade, 0, need, r) < need) return 0; // データ不足時は即終了
+   ArraySetAsSeries(r, true); // インデックスを現在足から遡る形に統一
    double close1 = r[1].close;
    double open1  = r[1].open;
 
@@ -590,7 +599,8 @@ void TryExit()
 
    // 逆行即切り
    double atr1 = GetATR(TF_Trade, ATR_Period_M1, 1);
-   MqlRates r[3];
+   // ArraySetAsSeriesを安全に使うため動的配列へ変更（静的配列ではコンパイル警告になるため）
+   MqlRates r[];
    if(CopyRates(_Symbol, TF_Trade, 0, 3, r) < 3) return;
    ArraySetAsSeries(r, true);
    double close1 = r[1].close;
@@ -644,6 +654,10 @@ int OnInit()
    // ここでは固定スプレッド想定（必要に応じてSymbolInfoIntegerで取得可）
    SpreadPips  = 0.1;
 
+   // NaNValue を実行時に生成（0除算を避け、MathSqrt(-1.0)で確実にNaNを得る）
+   // 以降、インジケータ取得失敗などの異常値返却で統一的に利用する
+   NaNValue = MathSqrt(-1.0);
+
    // 最低限の履歴を確保（エラー抑止）
    MqlRates tmp1[], tmp2[];
    if(CopyRates(_Symbol, TF_Trade, 0, LookbackBars_M1, tmp1) <= 0)
@@ -668,7 +682,8 @@ void OnTick()
    if(!SymbolInfoTick(_Symbol, last_tick)) return;
 
    // 新バー判定（取引時間足＝M1）
-   MqlRates r[3];
+   // 静的確保では警告が出るため、動的配列で最新3本を取得し系列方向を揃える
+   MqlRates r[];
    if(CopyRates(_Symbol, TF_Trade, 0, 3, r) < 3) return;
    ArraySetAsSeries(r, true);
 
