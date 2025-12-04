@@ -130,36 +130,39 @@ bool   lastSellGate     = false;// H1文脈ゲート（SELL可否）
 // チャートパネル用のオブジェクト名（UseCustomPanelLabel=true時のみ生成する）
 string PanelObjectName  = "TrendRevFilterPanel";
 
+// 分割表示用の行数を記録（OBJ_LABELの文字数上限を回避するため、行ごとに別オブジェクトを生成）
+// ・前回生成した行数を覚えておき、新しい表示で不要になった行を確実に削除する
+// ・直前の行数を持っておくことで、チャート再描画が頻繁でもオブジェクトリークを防ぐ
+int PanelLastLineCount = 0;
+
 //==================================================================
 // ■ ユーティリティ
 //==================================================================
 
 // パネル用のOBJ_LABELを生成/更新する（フォントやサイズを変更したい場合に利用）
-//  ・UseCustomPanelLabel=falseなら呼ばれないため、既存のComment表示と干渉しない
-//  ・設定値を変更した場合にも毎回プロパティを上書きし、チャート再読み込み無しで反映できるようにする
-bool EnsurePanelLabel()
+//  ・行ごとに異なるオブジェクト名を割り当て、文字数上限による途中切れを防ぐ
+//  ・yOffsetで上下位置をずらすことで、行送りをシンプルに制御する
+bool EnsurePanelLabel(const string name, const int yOffset)
 {
    // 既に存在するか確認し、なければ生成する
    // ObjectFind は見つからない場合 -1 を返すため、「== -1」で未生成を明示判定する
-   // 以前は論理否定(!)で判定していたが、-1 も "真" と解釈されるため生成が一度も行われず
-   // パネルが表示されない不具合があった。ここで明確に -1 比較へ修正する。
-   if(ObjectFind(0, PanelObjectName) == -1)
+   if(ObjectFind(0, name) == -1)
    {
-      if(!ObjectCreate(0, PanelObjectName, OBJ_LABEL, 0, 0, 0))
+      if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
          return(false); // 何らかの理由で作成失敗
    }
 
    // 位置と見栄えを入力パラメータに合わせて毎回上書き（チャート設定変更にも追従）
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_CORNER, PanelCorner);
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_XDISTANCE, PanelXOffset);
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_YDISTANCE, PanelYOffset);
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_COLOR, PanelFontColor);
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_FONTSIZE, PanelFontSize);
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_SELECTABLE, false); // 誤操作防止のため選択不可
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_SELECTED, false);
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_BACK, false);       // 前面に表示
-   ObjectSetInteger(0, PanelObjectName, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
-   ObjectSetString (0, PanelObjectName, OBJPROP_FONT, PanelFontName);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, PanelCorner);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, PanelXOffset);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, yOffset);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, PanelFontColor);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, PanelFontSize);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false); // 誤操作防止のため選択不可
+   ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);       // 前面に表示
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+   ObjectSetString (0, name, OBJPROP_FONT, PanelFontName);
    return(true);
 }
 
@@ -172,21 +175,57 @@ void DisplayOverlayText(const string text)
 {
    if(UseCustomPanelLabel)
    {
-      // OBJ_LABELを使う場合はフォント指定を反映した上でテキストを更新する
-      if(EnsurePanelLabel())
+      // 文字数上限対策のため、改行で分割し「行ごとに別OBJ_LABELを生成」して安全に表示する
+      // ・OBJ_LABELは1オブジェクトあたりの文字数に上限があるため、長文を1つへ流し込むと途中で切れる
+      // ・行配列を作って個別に配置することで、長い説明文でも確実にチャートへ表示できるようにする
+      string lines[];
+      int lineCount = StringSplit(text, '\n', lines);
+
+      // 分割できなかった場合は既存表示を消してから終了（異常系でも前回の残骸を残さない）
+      if(lineCount <= 0)
       {
-         // ObjectSetText にチャートID引数を付けると MQL5 ではコンパイルエラーになるため、
-         // 代わりに ObjectSetString(OBJPROP_TEXT) でテキストを更新する。
-         // フォントサイズ・フォント名・色は EnsurePanelLabel() 内で毎回セット済みなので、
-         // ここではテキストのみを差し替えるようにする。
-         ObjectSetString(0, PanelObjectName, OBJPROP_TEXT, text);
+         ClearOverlay();
+         return;
       }
+
+      int yOffset = PanelYOffset;
+
+      // 行ごとにラベルを作成/更新し、フォント指定を反映したうえでテキストをセットする
+      for(int i=0; i<lineCount; i++)
+      {
+         string labelName = PanelObjectName + "_" + IntegerToString(i);
+
+         // 必要な行数だけ順次生成（既存があれば上書き）
+         if(EnsurePanelLabel(labelName, yOffset))
+         {
+            // ObjectSetText にチャートID引数を付けると MQL5 ではコンパイルエラーになるため、
+            // 代わりに ObjectSetString(OBJPROP_TEXT) でテキストを更新する。
+            ObjectSetString(0, labelName, OBJPROP_TEXT, lines[i]);
+         }
+
+         // 行送り（フォントサイズに余白+2pxを加えて読みやすくする）
+         yOffset += PanelFontSize + 2;
+      }
+
+      // 余った旧行を削除し、チャートに不要なラベルが残らないようにする
+      for(int j=lineCount; j<PanelLastLineCount; j++)
+      {
+         string obsoleteName = PanelObjectName + "_" + IntegerToString(j);
+         if(ObjectFind(0, obsoleteName) != -1)
+            ObjectDelete(0, obsoleteName);
+      }
+
+      // 最新の行数を記録（次回削除に利用）
+      PanelLastLineCount = lineCount;
+
       // Commentは空にしておき、他EAと重ならないようにする
       Comment("");
    }
    else
    {
-      // 従来どおり軽量なCommentを使用（フォント固定である点を明示）
+      // 従来どおり軽量なCommentを使用（フォント固定である点を明示）。
+      // OBJ_LABELを使っていた場合は古いラベルを削除してから移行する。
+      ClearOverlay();
       Comment(text);
    }
 }
@@ -195,10 +234,17 @@ void DisplayOverlayText(const string text)
 void ClearOverlay()
 {
    Comment("");
-   if(ObjectFind(0, PanelObjectName))
+
+   // 直近の行数に応じてOBJ_LABELを確実に削除し、表示が重ならないようにする
+   for(int i=0; i<PanelLastLineCount; i++)
    {
-      ObjectDelete(0, PanelObjectName);
+      string labelName = PanelObjectName + "_" + IntegerToString(i);
+      if(ObjectFind(0, labelName) != -1)
+         ObjectDelete(0, labelName);
    }
+
+   // 完全クリア後に行数をリセットし、次回再描画時に正しく作り直す
+   PanelLastLineCount = 0;
 }
 
 // 現在のシンボル桁数に応じた 1pips のポイント値を計算
