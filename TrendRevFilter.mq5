@@ -109,6 +109,13 @@ int    posBars       = 0;
 double posMFE        = 0.0;     // pips
 double posMAE        = 0.0;     // pips
 
+// チャート表示用の最新スコア保持（直近確定バーの評価結果をそのまま見られるようにする）
+int    lastRevBuyScore  = 0;    // SELL方向の逆張りスコア（SELLを試みる際のveto値）
+int    lastRevSellScore = 0;    // BUY方向の逆張りスコア（BUYを試みる際のveto値）
+int    lastEntryScore   = 0;    // 順張りエントリースコア
+bool   lastBuyGate      = false;// H1文脈ゲート（BUY可否）
+bool   lastSellGate     = false;// H1文脈ゲート（SELL可否）
+
 //==================================================================
 // ■ ユーティリティ
 //==================================================================
@@ -344,12 +351,41 @@ void ReverseScores(int &revBuy, int &revSell)
 }
 
 //==================================================================
+// ■ チャート表示更新（逆張りスコア・順張りスコアを最新確定バー基準で表示）
+//    ・EntryScore / ReverseScores を再計算し、Commentで簡易パネルを表示
+//    ・「基準値と現在値」を明示して、フィルタがどの程度で作動するかを視覚化
+//==================================================================
+void UpdateScoreOverlay()
+{
+   // 最新確定バー（shift=1）の情報を再評価し、画面表示用の変数に保存
+   lastBuyGate  = false;
+   lastSellGate = false;
+   lastEntryScore = EntryScore(lastBuyGate, lastSellGate); // 文脈ゲートも同時に更新
+
+   int rb=0, rs=0;
+   ReverseScores(rb, rs); // 逆張りスコアを取得（値が取れなかった場合は0のまま）
+   lastRevBuyScore  = rb;
+   lastRevSellScore = rs;
+
+   // 表示用テキストを作成（基準値がどこにあるかも併記）
+   string text = "TrendRevFilter スコア状況\n";
+   text += StringFormat("EntryScore: %d (買い基準 +%d / 売り基準 -%d)\n", lastEntryScore, ENTRY_T, ENTRY_T);
+   text += StringFormat("H1ゲート: BUY=%s / SELL=%s\n", lastBuyGate ? "ON" : "OFF", lastSellGate ? "ON" : "OFF");
+   text += StringFormat("逆張りスコア: BUY方向=%d / SELL方向=%d (veto基準 %d)", lastRevBuyScore, lastRevSellScore, REV_T);
+
+   // Commentでチャート左上に貼り付け（配色やフォント変更が不要な場合は軽量のままにする）
+   Comment(text);
+}
+
+//==================================================================
 // ■ 順張りエントリー・スコア（確定バー：shift=1）
 //    H1：EMA傾き・R2・ADX で文脈ゲート
 //    M1：ドンチャン位置×短期Z、バンド幅%位（簡略化：低ボラ優遇）
 //        プルバック(EMAとの距離)、CLV累積 などを加点
+//    ※ buyGate / sellGate は true/false の論理フラグなので、型を bool で定義して
+//       コンパイラ警告や型変換エラーを防ぐ（MQL5 では参照引数の型一致が必須）。
 //==================================================================
-int EntryScore(double &buyGate, double &sellGate)
+int EntryScore(bool &buyGate, bool &sellGate)
 {
    buyGate  = false;
    sellGate = false;
@@ -525,7 +561,8 @@ int ExitScore(int dir)
 void TryEntry()
 {
    // ゲート & スコア
-   double buyGate=false, sellGate=false;
+   // 参照渡しを行うため bool で明示し、文脈ゲートが ON/OFF かを正確に保持する
+   bool buyGate=false, sellGate=false;
    int es = EntryScore(buyGate, sellGate);
    if(!hasPosition)
    {
@@ -674,6 +711,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    Print("TrendRevFilter deinit. reason=", reason);
+   Comment(""); // チャート上のパネルを消しておく（別EAへの引き継ぎを避けるため）
 }
 
 void OnTick()
@@ -701,6 +739,11 @@ void OnTick()
          if(pf < posMAE) posMAE = pf;
          posBars++;
       }
+
+      // チャートオーバーレイ（スコアと基準値の可視化）を更新
+      //  ※逆張りフィルタが効いているかを視覚的に把握できるように、
+      //    「EntryScore」「逆張りスコア」「基準値」をまとめて表示する
+      UpdateScoreOverlay();
 
       // まず決済判定
       TryExit();
