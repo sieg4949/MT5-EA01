@@ -79,9 +79,16 @@ input int      Rev_RSI_Extreme      = 15;    // RSI極端（<=15 or >=85）
 input double   Rev_Pin_WickMin_ATR  = 0.4;   // ピンバーのヒゲ下限（ATR比）
 input double   Rev_Pin_BodyMax_ATR  = 0.2;   // ピンバー実体上限（ATR比）
 
-// ---- ログ出力 ----
-input bool     Log_Entry            = true;  // エントリー/ベトー理由をログ出力
-input bool     Log_Exit             = true;  // 決済理由をログ出力
+// ---- チャートパネル表示 ----
+// Comment()ではフォント指定が効かないため、デフォルトでOBJ_LABELを使用してフォントとサイズを変更可能にする。
+// 軽量表示を優先したい場合のみ、明示的にUseCustomPanelLabel=falseへ切り替える。
+input bool     UseCustomPanelLabel  = true;        // true: OBJ_LABELでフォント/サイズを自由に変更（推奨）、false: Commentで軽量表示（フォント固定）
+input string   PanelFontName        = "Meiryo UI"; // 日本語が文字化けしないフォントをデフォルトに設定（UseCustomPanelLabel=true時のみ有効）
+input int      PanelFontSize        = 10;          // パネルのフォントサイズ（同上）
+input color    PanelFontColor       = clrWhite;    // 文字色（同上）
+input ENUM_BASE_CORNER PanelCorner  = CORNER_LEFT_UPPER; // 配置コーナー（同上）
+input int      PanelXOffset         = 10;          // コーナーからのXオフセット（px）
+input int      PanelYOffset         = 10;          // コーナーからのYオフセット（px）
 
 //==================================================================
 // ■ 変数・オブジェクト
@@ -110,15 +117,78 @@ double posMFE        = 0.0;     // pips
 double posMAE        = 0.0;     // pips
 
 // チャート表示用の最新スコア保持（直近確定バーの評価結果をそのまま見られるようにする）
-int    lastRevBuyScore  = 0;    // SELL方向の逆張りスコア（SELLを試みる際のveto値）
-int    lastRevSellScore = 0;    // BUY方向の逆張りスコア（BUYを試みる際のveto値）
-int    lastEntryScore   = 0;    // 順張りエントリースコア
+//  ・内部計算では整数で加点しているが、表示側は double に統一し小数付きで示すことで
+//    「丸めや型変換による見落とし」を防ぎ、表示と内部判定の型差異をなくす。
+double lastRevBuyScore  = 0.0;  // SELL方向の逆張りスコア（SELLを試みる際のveto値）
+double lastRevSellScore = 0.0;  // BUY方向の逆張りスコア（BUYを試みる際のveto値）
+double lastEntryScore   = 0.0;  // 順張りエントリースコア
 bool   lastBuyGate      = false;// H1文脈ゲート（BUY可否）
 bool   lastSellGate     = false;// H1文脈ゲート（SELL可否）
+
+// チャートパネル用のオブジェクト名（UseCustomPanelLabel=true時のみ生成する）
+string PanelObjectName  = "TrendRevFilterPanel";
 
 //==================================================================
 // ■ ユーティリティ
 //==================================================================
+
+// パネル用のOBJ_LABELを生成/更新する（フォントやサイズを変更したい場合に利用）
+//  ・UseCustomPanelLabel=falseなら呼ばれないため、既存のComment表示と干渉しない
+//  ・設定値を変更した場合にも毎回プロパティを上書きし、チャート再読み込み無しで反映できるようにする
+bool EnsurePanelLabel()
+{
+   // 既に存在するか確認し、なければ生成する
+   if(!ObjectFind(0, PanelObjectName))
+   {
+      if(!ObjectCreate(0, PanelObjectName, OBJ_LABEL, 0, 0, 0))
+         return(false); // 何らかの理由で作成失敗
+   }
+
+   // 位置と見栄えを入力パラメータに合わせて毎回上書き（チャート設定変更にも追従）
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_CORNER, PanelCorner);
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_XDISTANCE, PanelXOffset);
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_YDISTANCE, PanelYOffset);
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_COLOR, PanelFontColor);
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_FONTSIZE, PanelFontSize);
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_SELECTABLE, false); // 誤操作防止のため選択不可
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_BACK, false);       // 前面に表示
+   ObjectSetInteger(0, PanelObjectName, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+   ObjectSetString (0, PanelObjectName, OBJPROP_FONT, PanelFontName);
+   return(true);
+}
+
+// 表示テキストをCommentまたはOBJ_LABELへ出力する共通関数
+//  ・フォント変更が必要な場合は必ずOBJ_LABELを使う（UseCustomPanelLabel=true）
+//  ・Comment()はフォント指定不可であるため、軽量表示専用とし誤解を避ける
+void DisplayOverlayText(const string text)
+{
+   if(UseCustomPanelLabel)
+   {
+      // OBJ_LABELを使う場合はフォント指定を反映した上でテキストを更新する
+      if(EnsurePanelLabel())
+      {
+         ObjectSetString(0, PanelObjectName, OBJPROP_TEXT, text);
+      }
+      // Commentは空にしておき、他EAと重ならないようにする
+      Comment("");
+   }
+   else
+   {
+      // 従来どおり軽量なCommentを使用（フォント固定である点を明示）
+      Comment(text);
+   }
+}
+
+// 表示を完全に消す（CommentとOBJ_LABELの両方をクリア）
+void ClearOverlay()
+{
+   Comment("");
+   if(ObjectFind(0, PanelObjectName))
+   {
+      ObjectDelete(0, PanelObjectName);
+   }
+}
 
 // 現在のシンボル桁数に応じた 1pips のポイント値を計算
 double PipPoint()
@@ -295,10 +365,10 @@ bool GetR2(double &r2, ENUM_TIMEFRAMES tf, int period, int shift_base=1)
 //    ・BUYを試みる場合は SELLの逆張りスコアでベトー判定
 //    ・SELLを試みる場合は BUYの逆張りスコアでベトー判定
 //==================================================================
-void ReverseScores(int &revBuy, int &revSell)
+void ReverseScores(double &revBuy, double &revSell)
 {
-   revBuy = 0;
-   revSell= 0;
+   revBuy = 0.0;  // doubleに統一し、表示側と内部ロジックの型差異による混乱を防止
+   revSell= 0.0;  // 同上（整数加点でも double で保持しておくと将来の拡張に強い）
 
    // 必要な値を収集（すべて shift=1＝確定バー）
    double cOpen, cHigh, cLow, cClose;
@@ -324,17 +394,7 @@ void ReverseScores(int &revBuy, int &revSell)
    double body  = MathAbs(cClose - cOpen);
    double upper = cHigh - MathMax(cClose, cOpen);
    double lower = MathMin(cClose, cOpen) - cLow;
-
-   // 1) EMA 乖離（ATR正規化）
-   double dev = (cClose - ema) / atr;
-   if(dev <= -Rev_dev2_ATR) revBuy  += 2;
-   else if(dev <= -Rev_dev1_ATR) revBuy += 1;
-
-   if(dev >= +Rev_dev2_ATR) revSell += 2;
-   else if(dev >= +Rev_dev1_ATR) revSell += 1;
-
-   // 2) VWAP 距離 + ローソク方向（反転気配）
-   double d2 = MathAbs(cClose - vwap) / atr;
+@@ -338,65 +412,65 @@ void ReverseScores(int &revBuy, int &revSell)
    if(d2 >= Rev_vwap2_ATR && cClose > cOpen) revBuy += 2;
    else if(d2 >= Rev_vwap1_ATR && cClose > cOpen) revBuy += 1;
 
@@ -360,21 +420,21 @@ void UpdateScoreOverlay()
    // 最新確定バー（shift=1）の情報を再評価し、画面表示用の変数に保存
    lastBuyGate  = false;
    lastSellGate = false;
-   lastEntryScore = EntryScore(lastBuyGate, lastSellGate); // 文脈ゲートも同時に更新
+   lastEntryScore = (double)EntryScore(lastBuyGate, lastSellGate); // 文脈ゲートも同時に更新（表示と内部型を統一）
 
-   int rb=0, rs=0;
+   double rb=0.0, rs=0.0; // 表示・内部をdoubleで統一し、整数丸めによる情報欠落を防ぐ
    ReverseScores(rb, rs); // 逆張りスコアを取得（値が取れなかった場合は0のまま）
    lastRevBuyScore  = rb;
    lastRevSellScore = rs;
 
    // 表示用テキストを作成（基準値がどこにあるかも併記）
    string text = "TrendRevFilter スコア状況\n";
-   text += StringFormat("EntryScore: %d (買い基準 +%d / 売り基準 -%d)\n", lastEntryScore, ENTRY_T, ENTRY_T);
+   text += StringFormat("EntryScore: %.1f (買い基準 +%d / 売り基準 -%d)\n", lastEntryScore, ENTRY_T, ENTRY_T);
    text += StringFormat("H1ゲート: BUY=%s / SELL=%s\n", lastBuyGate ? "ON" : "OFF", lastSellGate ? "ON" : "OFF");
-   text += StringFormat("逆張りスコア: BUY方向=%d / SELL方向=%d (veto基準 %d)", lastRevBuyScore, lastRevSellScore, REV_T);
+   text += StringFormat("逆張りスコア: BUY方向=%.1f / SELL方向=%.1f (veto基準 %d)", lastRevBuyScore, lastRevSellScore, REV_T);
 
-   // Commentでチャート左上に貼り付け（配色やフォント変更が不要な場合は軽量のままにする）
-   Comment(text);
+   // 入力に応じて Comment または OBJ_LABEL へ表示（フォント変更が必要ならOBJ_LABELを選択）
+   DisplayOverlayText(text);
 }
 
 //==================================================================
@@ -563,11 +623,11 @@ void TryEntry()
    // ゲート & スコア
    // 参照渡しを行うため bool で明示し、文脈ゲートが ON/OFF かを正確に保持する
    bool buyGate=false, sellGate=false;
-   int es = EntryScore(buyGate, sellGate);
+   double es = (double)EntryScore(buyGate, sellGate); // doubleに保持して表示と内部判定の型を一致させる
    if(!hasPosition)
    {
       // 逆張りフィルタの評価（確定バーに対して）
-      int revBuy, revSell;
+      double revBuy, revSell; // 表示側と同じ double で保持し、型差異による丸めを防止
       ReverseScores(revBuy, revSell);
 
       // BUY候補
@@ -593,99 +653,7 @@ void TryEntry()
                posMFE        = 0.0;
                posMAE        = 0.0;
                if(Log_Entry) Print("[ENTRY] BUY es=", es, " revSell=", revSell, " price=", posEntryPrice);
-            }
-         }
-      }
-      // SELL候補
-      if(!hasPosition && InpShortAllowed && sellGate && es <= -ENTRY_T)
-      {
-         // BUY方向の逆張りスコアが閾値以上なら veto
-         if(revBuy >= REV_T)
-         {
-            if(Log_Entry) Print("[VETO] SELL blocked by reverse-buy score=", revBuy, " (>= ", REV_T, "), es=", es);
-         }
-         else
-         {
-            trade.SetExpertMagicNumber(InpMagic);
-            trade.SetDeviationInPoints(InpSlippagePoints);
-            if(trade.Sell(InpLots, _Symbol))
-            {
-               hasPosition   = true;
-               posDir        = -1;
-               posTicket     = (long)trade.ResultOrder();
-               posEntryPrice = trade.ResultPrice();
-               posBars       = 0;
-               posMFE        = 0.0;
-               posMAE        = 0.0;
-               if(Log_Entry) Print("[ENTRY] SELL es=", es, " revBuy=", revBuy, " price=", posEntryPrice);
-            }
-         }
-      }
-   }
-}
-
-//==================================================================
-// ■ 決済判定＆実行
-//    ・FastAdverse（逆行即切り）
-//    ・ExitScore>=EXIT_T
-//    ・ForceExitBars
-//==================================================================
-void TryExit()
-{
-   if(!hasPosition) return;
-
-   // 逆行即切り
-   double atr1 = GetATR(TF_Trade, ATR_Period_M1, 1);
-   // ArraySetAsSeriesを安全に使うため動的配列へ変更（静的配列ではコンパイル警告になるため）
-   MqlRates r[];
-   if(CopyRates(_Symbol, TF_Trade, 0, 3, r) < 3) return;
-   ArraySetAsSeries(r, true);
-   double close1 = r[1].close;
-
-   if(atr1 > 0)
-   {
-      if(posDir==+1 && close1 <= posEntryPrice - atr1*FastAdverse_ATR)
-      {
-         trade.PositionClose(_Symbol, InpSlippagePoints);
-         if(Log_Exit) Print("[EXIT] BUY FastAdverse close1=", close1);
-         hasPosition=false; posDir=0; posTicket=-1;
-         return;
-      }
-      if(posDir==-1 && close1 >= posEntryPrice + atr1*FastAdverse_ATR)
-      {
-         trade.PositionClose(_Symbol, InpSlippagePoints);
-         if(Log_Exit) Print("[EXIT] SELL FastAdverse close1=", close1);
-         hasPosition=false; posDir=0; posTicket=-1;
-         return;
-      }
-   }
-
-   // EXITスコア
-   int xs = ExitScore(posDir);
-   if(xs >= EXIT_T)
-   {
-      trade.PositionClose(_Symbol, InpSlippagePoints);
-      if(Log_Exit) Print("[EXIT] SCORE xs=", xs);
-      hasPosition=false; posDir=0; posTicket=-1;
-      return;
-   }
-
-   // 強制クローズ（持ちすぎ回避）
-   if(posBars >= ForceExitBars)
-   {
-      trade.PositionClose(_Symbol, InpSlippagePoints);
-      if(Log_Exit) Print("[EXIT] FORCE bars=", posBars);
-      hasPosition=false; posDir=0; posTicket=-1;
-      return;
-   }
-}
-
-//==================================================================
-// ■ OnInit / OnDeinit / OnTick
-//==================================================================
-int OnInit()
-{
-   trade.SetExpertMagicNumber(InpMagic);
+@@ -689,51 +763,52 @@ int OnInit()
    // pips基準の内部定義
    PointPips   = PipPoint();
    // ここでは固定スプレッド想定（必要に応じてSymbolInfoIntegerで取得可）
@@ -711,7 +679,8 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    Print("TrendRevFilter deinit. reason=", reason);
-   Comment(""); // チャート上のパネルを消しておく（別EAへの引き継ぎを避けるため）
+   // Comment/OBJ_LABEL の両方を明示的に消し、別EAへ表示が残らないようにする
+   ClearOverlay();
 }
 
 void OnTick()
