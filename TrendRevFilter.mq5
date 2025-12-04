@@ -28,6 +28,8 @@ input ulong    InpMagic             = 20251204; // マジックナンバー
 input bool     InpLongAllowed       = true;   // 買い許可
 input bool     InpShortAllowed      = true;   // 売り許可
 input bool     InpOnePositionOnly   = true;   // 同時1ポジ制限（true推奨）
+input bool     Log_Entry            = false;  // true: エントリー/ベトーのログを詳細表示
+input bool     Log_Exit             = false;  // true: 決済処理のログを詳細表示
 
 // ---- 時間足・データ長 ----
 input ENUM_TIMEFRAMES  TF_Trade     = PERIOD_M1;   // 取引用（M1固定推奨）
@@ -138,7 +140,10 @@ string PanelObjectName  = "TrendRevFilterPanel";
 bool EnsurePanelLabel()
 {
    // 既に存在するか確認し、なければ生成する
-   if(!ObjectFind(0, PanelObjectName))
+   // ObjectFind は見つからない場合 -1 を返すため、「== -1」で未生成を明示判定する
+   // 以前は論理否定(!)で判定していたが、-1 も "真" と解釈されるため生成が一度も行われず
+   // パネルが表示されない不具合があった。ここで明確に -1 比較へ修正する。
+   if(ObjectFind(0, PanelObjectName) == -1)
    {
       if(!ObjectCreate(0, PanelObjectName, OBJ_LABEL, 0, 0, 0))
          return(false); // 何らかの理由で作成失敗
@@ -161,6 +166,8 @@ bool EnsurePanelLabel()
 // 表示テキストをCommentまたはOBJ_LABELへ出力する共通関数
 //  ・フォント変更が必要な場合は必ずOBJ_LABELを使う（UseCustomPanelLabel=true）
 //  ・Comment()はフォント指定不可であるため、軽量表示専用とし誤解を避ける
+//  ・OBJ_LABEL へは ObjectSetText を用いて改行コード(\n)を正しく反映させ、
+//    「1 行にすべて繋がってしまう」症状を防ぐ
 void DisplayOverlayText(const string text)
 {
    if(UseCustomPanelLabel)
@@ -168,6 +175,10 @@ void DisplayOverlayText(const string text)
       // OBJ_LABELを使う場合はフォント指定を反映した上でテキストを更新する
       if(EnsurePanelLabel())
       {
+         // ObjectSetText にチャートID引数を付けると MQL5 ではコンパイルエラーになるため、
+         // 代わりに ObjectSetString(OBJPROP_TEXT) でテキストを更新する。
+         // フォントサイズ・フォント名・色は EnsurePanelLabel() 内で毎回セット済みなので、
+         // ここではテキストのみを差し替えるようにする。
          ObjectSetString(0, PanelObjectName, OBJPROP_TEXT, text);
       }
       // Commentは空にしておき、他EAと重ならないようにする
@@ -364,8 +375,10 @@ bool GetR2(double &r2, ENUM_TIMEFRAMES tf, int period, int shift_base=1)
 // ■ 逆張りフィルタ・スコア（確定バー：shift=1の足に対して評価）
 //    ・BUYを試みる場合は SELLの逆張りスコアでベトー判定
 //    ・SELLを試みる場合は BUYの逆張りスコアでベトー判定
+//    ・インジ取得失敗時に 0.0 固定にならないよう、フェイルセーフの
+//      デフォルト値を用意して常に算出を継続する
 //==================================================================
-void ReverseScores(double &revBuy, double &revSell)
+bool ReverseScores(double &revBuy, double &revSell)
 {
    revBuy = 0.0;  // doubleに統一し、表示側と内部ロジックの型差異による混乱を防止
    revSell= 0.0;  // 同上（整数加点でも double で保持しておくと将来の拡張に強い）
@@ -375,7 +388,7 @@ void ReverseScores(double &revBuy, double &revSell)
    // 静的配列ではArraySetAsSeriesが利用できないため動的配列に変更し、
    // 足方向を確定足基準（series=true）へ揃えて参照ミスを防止する
    MqlRates r[];
-   if(CopyRates(_Symbol, TF_Trade, 0, 3, r) < 3) return;
+   if(CopyRates(_Symbol, TF_Trade, 0, 3, r) < 3) return false; // 本数不足時は失敗扱い
    ArraySetAsSeries(r, true);
    cOpen  = r[1].open;
    cHigh  = r[1].high;
@@ -386,20 +399,53 @@ void ReverseScores(double &revBuy, double &revSell)
    double ema  = GetEMA(TF_Trade, EMA_Period_M1, 1);
    double rsi  = GetRSI(TF_Trade, RSI_Period, 1);
    double vwap;
-   if(!GetDailyVWAP(vwap, TF_Trade, 1)) return;
+   if(!GetDailyVWAP(vwap, TF_Trade, 1)) vwap = cClose; // VWAP取得失敗時は現在値を代用し、0固定を避ける
 
-   if(atr <= 0 || MathIsValidNumber(atr)==false) return;
+   // ATR/EMA/RSI が NaN や 0 だった場合のフェイルセーフ
+   //  ・atr: 最低でも当該足の高安幅を採用し、0除算を回避
+   //  ・ema: 取得できない場合は終値を代用し「乖離=0」に倒す
+   //  ・rsi: 中立の50をセットし、逆張りスコアへ余計な加点を行わない
+   double range = MathMax(cHigh - cLow, _Point);
+   if(!MathIsValidNumber(atr) || atr <= 0) atr = range;
+   if(!MathIsValidNumber(ema)) ema = cClose;
+   if(!MathIsValidNumber(rsi)) rsi = 50.0;
 
    // キャンドル構造
    double body  = MathAbs(cClose - cOpen);
    double upper = cHigh - MathMax(cClose, cOpen);
    double lower = MathMin(cClose, cOpen) - cLow;
-@@ -338,65 +412,65 @@ void ReverseScores(int &revBuy, int &revSell)
-   if(d2 >= Rev_vwap2_ATR && cClose > cOpen) revBuy += 2;
-   else if(d2 >= Rev_vwap1_ATR && cClose > cOpen) revBuy += 1;
 
-   if(d2 >= Rev_vwap2_ATR && cClose < cOpen) revSell += 2;
-   else if(d2 >= Rev_vwap1_ATR && cClose < cOpen) revSell += 1;
+   // 価格と基準線の乖離をATR比で算出
+   double d1 = MathAbs(cClose - ema)  / atr; // EMAとの距離（ATR換算）
+   double d2 = MathAbs(cClose - vwap) / atr; // VWAPとの距離（ATR換算）
+
+   // 1) EMA 乖離による逆張りスコア
+   if(cClose > ema)
+   {
+      // 価格がEMAより上 → 上昇の行き過ぎとしてSELL vetoへ加点
+      if(d1 >= Rev_dev2_ATR) revSell += 2;
+      else if(d1 >= Rev_dev1_ATR) revSell += 1;
+   }
+   else if(cClose < ema)
+   {
+      // 価格がEMAより下 → 下落の行き過ぎとしてBUY vetoへ加点
+      if(d1 >= Rev_dev2_ATR) revBuy += 2;
+      else if(d1 >= Rev_dev1_ATR) revBuy += 1;
+   }
+
+   // 2) VWAP からの乖離による逆張りスコア
+   if(cClose > vwap)
+   {
+      // VWAPより上に位置 → 伸び切りによる反落を警戒し、SELL vetoを強化
+      if(d2 >= Rev_vwap2_ATR && cClose > cOpen) revSell += 2;
+      else if(d2 >= Rev_vwap1_ATR && cClose > cOpen) revSell += 1;
+   }
+   else if(cClose < vwap)
+   {
+      // VWAPより下に位置 → 売られ過ぎからの反発を警戒し、BUY vetoを強化
+      if(d2 >= Rev_vwap2_ATR && cClose < cOpen) revBuy += 2;
+      else if(d2 >= Rev_vwap1_ATR && cClose < cOpen) revBuy += 1;
+   }
 
    // 3) RSI 極端 + ローソク方向
    if(rsi <= Rev_RSI_Extreme && cClose > cOpen) revBuy += 1;
@@ -408,6 +454,8 @@ void ReverseScores(double &revBuy, double &revSell)
    // 4) ピンバー（ヒゲ長・実体小）
    if( (lower/atr) >= Rev_Pin_WickMin_ATR && (body/atr) <= Rev_Pin_BodyMax_ATR ) revBuy += 1;
    if( (upper/atr) >= Rev_Pin_WickMin_ATR && (body/atr) <= Rev_Pin_BodyMax_ATR ) revSell+= 1;
+
+   return true; // すべての評価を完了
 }
 
 //==================================================================
@@ -422,10 +470,14 @@ void UpdateScoreOverlay()
    lastSellGate = false;
    lastEntryScore = (double)EntryScore(lastBuyGate, lastSellGate); // 文脈ゲートも同時に更新（表示と内部型を統一）
 
-   double rb=0.0, rs=0.0; // 表示・内部をdoubleで統一し、整数丸めによる情報欠落を防ぐ
-   ReverseScores(rb, rs); // 逆張りスコアを取得（値が取れなかった場合は0のまま）
-   lastRevBuyScore  = rb;
-   lastRevSellScore = rs;
+   double rb = lastRevBuyScore; // 前回値で初期化し、取得失敗時の「0.0固定」を避ける
+   double rs = lastRevSellScore;
+   bool revOk = ReverseScores(rb, rs); // 逆張りスコアを取得（フェイルセーフ付き）
+   if(revOk)
+   {
+      lastRevBuyScore  = rb;
+      lastRevSellScore = rs;
+   }
 
    // 表示用テキストを作成（基準値がどこにあるかも併記）
    string text = "TrendRevFilter スコア状況\n";
@@ -616,6 +668,69 @@ int ExitScore(int dir)
 }
 
 //==================================================================
+// ■ 決済実行
+//    ・ExitScore で算出したスコアが閾値以上なら成行クローズ
+//    ・ForceExitBars を超えた長期保有は強制決済してドローダウン拡大を防ぐ
+//    ・チケットやシンボルの不一致が起きた場合は状態をリセットし、次回の
+//      OnTick で再同期できるようにする
+//==================================================================
+void TryExit()
+{
+   // 管理ポジションが無い場合は即終了（無駄なAPI呼び出しを避ける）
+   if(!hasPosition) return;
+
+   // チケットとシンボル/マジックが一致するかを厳密に確認
+   bool selected=false;
+   if(posTicket>0 && PositionSelectByTicket((ulong)posTicket))
+   {
+      if(PositionGetString(POSITION_SYMBOL)==_Symbol &&
+         PositionGetInteger(POSITION_MAGIC)==(long)InpMagic)
+      {
+         selected=true;
+      }
+   }
+
+   // 不一致の場合は内部状態をリセットして処理を中断
+   if(!selected)
+   {
+      hasPosition=false;
+      posDir=0;
+      posTicket=-1;
+      return;
+   }
+
+   // 強制クローズ判定（時間経過に関わるブレを抑えるため最優先で実行）
+   if(posBars >= ForceExitBars)
+   {
+      if(Log_Exit) Print("[EXIT] Force close by bar limit posBars=", posBars, " limit=", ForceExitBars);
+      trade.SetExpertMagicNumber(InpMagic);
+      trade.SetDeviationInPoints(InpSlippagePoints);
+      if(trade.PositionClose(posTicket))
+      {
+         hasPosition=false;
+         posDir=0;
+         posTicket=-1;
+      }
+      return; // 強制決済後は他の判定を行わない
+   }
+
+   // EXIT スコアを算出し、閾値以上なら決済を試行
+   int es = ExitScore(posDir);
+   if(es >= EXIT_T)
+   {
+      if(Log_Exit) Print("[EXIT] Score>=T es=", es, " (>=", EXIT_T, ") dir=", posDir);
+      trade.SetExpertMagicNumber(InpMagic);
+      trade.SetDeviationInPoints(InpSlippagePoints);
+      if(trade.PositionClose(posTicket))
+      {
+         hasPosition=false;
+         posDir=0;
+         posTicket=-1;
+      }
+   }
+}
+
+//==================================================================
 // ■ エントリー実行（逆張りフィルタで veto したら入らない）
 //==================================================================
 void TryEntry()
@@ -628,7 +743,13 @@ void TryEntry()
    {
       // 逆張りフィルタの評価（確定バーに対して）
       double revBuy, revSell; // 表示側と同じ double で保持し、型差異による丸めを防止
-      ReverseScores(revBuy, revSell);
+      bool revOk = ReverseScores(revBuy, revSell);
+      if(!revOk)
+      {
+         // インジ取得失敗時はベトー判定をスキップし、安全側で見送り
+         if(Log_Entry) Print("[VETO] Reverse score unavailable -> skip entry");
+         return;
+      }
 
       // BUY候補
       if(InpLongAllowed && buyGate && es >= ENTRY_T)
@@ -653,7 +774,45 @@ void TryEntry()
                posMFE        = 0.0;
                posMAE        = 0.0;
                if(Log_Entry) Print("[ENTRY] BUY es=", es, " revSell=", revSell, " price=", posEntryPrice);
-@@ -689,51 +763,52 @@ int OnInit()
+            }
+         }
+      }
+
+      // SELL候補
+      if(InpShortAllowed && sellGate && es <= -ENTRY_T)
+      {
+         // BUY方向の逆張りスコアが閾値以上なら veto
+         if(revBuy >= REV_T)
+         {
+            if(Log_Entry) Print("[VETO] SELL blocked by reverse-buy score=", revBuy, " (>= ", REV_T, "), es=", es);
+         }
+         else
+         {
+            trade.SetExpertMagicNumber(InpMagic);
+            trade.SetDeviationInPoints(InpSlippagePoints);
+            if(trade.Sell(InpLots, _Symbol))
+            {
+               hasPosition   = true;
+               posDir        = -1;
+               posTicket     = (long)trade.ResultOrder();
+               posEntryPrice = trade.ResultPrice();
+               posBars       = 0;
+               posMFE        = 0.0;
+               posMAE        = 0.0;
+               if(Log_Entry) Print("[ENTRY] SELL es=", es, " revBuy=", revBuy, " price=", posEntryPrice);
+            }
+         }
+      }
+   }
+}
+
+//==================================================================
+// ■ OnInit：EA初期化処理
+//    ・pips換算の内部値やNaN定義の初期化
+//    ・最低限の履歴を確保し、データ不足時は初期化失敗で明示
+//==================================================================
+int OnInit()
+{
    // pips基準の内部定義
    PointPips   = PipPoint();
    // ここでは固定スプレッド想定（必要に応じてSymbolInfoIntegerで取得可）
