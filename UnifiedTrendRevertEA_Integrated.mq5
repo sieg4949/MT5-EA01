@@ -17,6 +17,40 @@
 
 #include <Trade/Trade.mqh>
 
+//============================= サーバー時刻共通取得 ============================
+// 目的   : MQL5ドキュメント（https://www.mql5.com/ja/docs/dateandtime/timecurrent）
+//          では TimeCurrent が「サーバー時刻を返す」標準APIとして案内されている。
+//          しかしビルド環境によっては TimeTradeServer / TimeCurrent のどちらかが
+//          未定義になるケースが報告されたため、関数化＋条件コンパイルで安全に
+//          フォールバックさせる。マクロではなく関数に戻すことで「引数が多い」
+//          といったマクロ解釈ミスを根本的に排除する。
+// 優先順 : 1) MQL5なら TimeTradeServer() を最優先（サーバー基準が最も正確）
+//          2) 上記が使えない場合は TimeCurrent()（MQL4/5共通で広く使える）
+//          3) どちらも使えない特殊環境では TimeLocal() を最後の砦として使用
+// 戻り値 : datetime（利用可能な最上位APIで取得した時刻）
+// 注意   : 常にサーバー基準の計算を試み、未定義エラーを避けるため #ifdef で
+//          呼び出し可能なAPIだけをコンパイルに含める。コメントも合わせて残す。
+//---------------------------------------------------------------------------
+datetime GetServerTime()
+{
+   // MQL5ならドキュメント推奨の TimeTradeServer を最初に試す。未定義環境では
+   // このブロック自体がコンパイルされないため、呼び出しでの「未定義識別子」
+   // エラーを完全に防げる。
+#ifdef __MQL5__
+   return TimeTradeServer();
+#else
+   // MQL4互換やTimeTradeServerが存在しない環境では TimeCurrent を使う。
+   // これも未定義な極端な環境では次のフォールバックに進む。
+   return TimeCurrent();
+#endif
+
+   // ここに到達するのは TimeCurrent すら提供されない想定外の環境のみ。
+   // ゼロ時刻を返すよりは端末ローカル時刻を返した方がログの解析に有用。
+   // （MQLプリプロセッサは #else の後にコードがあっても、上で return すれば
+   //   最適化で消されるためパフォーマンス上の問題は極小）
+   return TimeLocal();
+}
+
 //=========================== 入 力 値 ===============================
 // ■ゲート（H1 回帰β×σ）／ヒステリシス
 input bool   InpUseHysteresis     = true;     // ヒステリシスを使う
@@ -33,10 +67,9 @@ enum InpModuleMode
    MODE_RNG_ONLY = 2, // RNGのみ稼働（TRDは停止）
    MODE_ALL_OFF  = 3  // すべて停止（監視のみ）
 };
-input InpModuleMode InpModuleSwitch = MODE_BOTH; // 運用モード切替
+input InpModuleMode InpModuleSwitch = MODE_BOTH; // 運用モード切替（ここ1つで両モジュールを一括管理）
 
 // ■TRD（ブレイクアウト）
-input bool   InpEnableTRD         = true;     // TRDモジュール有効
 input double InpEntryBufferATR    = 0.28;     // 逆指値バッファ（ATR(M5)×倍率）※0.25-0.30で精度重視、ダマシ除去目的で距離を広げる
 input double InpEdgeEntryMin      = 0.85;     // Edgeエントリ下限（0..1）※強トレンドのみ狙うため0.85で精度優先に設定
 input int    InpHHLL_Lookback     = 6;        // HH/LL の参照本数（M5）
@@ -50,7 +83,6 @@ input double InpEDGE_Thresh       = 0.28;     // Edge EXITしきい値
 input int    InpEDGE_Consec       = 3;        // Edge EXIT連続本数
 
 // ■RNG（平均回帰）
-input bool   InpEnableRNG            = true;     // RNGモジュール有効
 input double InpZ_in                 = 2.00;     // |z|閾値（クロス／滞留トリガー共通）※2.0推奨（2.4→2.0で頻度↑）
 input int    InpZHoldBars            = 3;        // |z|が閾値以上に張り付いた場合の滞留本数トリガー
 input double InpZ_cut                = 3.0;      // |z| ≥ Z_cut で損切り
@@ -164,19 +196,16 @@ void   SelfReviewStatus(Regime regime, bool trdEnabled, bool rngEnabled, bool bo
 bool   ComputeZ_VR_OU(int sh, double &z, double &vr, double &ou_time);
 
 int    CurrentHourJST();                     // ブローカー時刻→UTC→JST(+9)
-bool   IsTRDEnabled();                       // モード＋個別入力を合成したTRD可否
-bool   IsRNGEnabled();                       // モード＋個別入力を合成したRNG可否
+bool   IsTRDEnabled();                       // 運用モードから求めるTRD可否
+bool   IsRNGEnabled();                       // 運用モードから求めるRNG可否
 
 //============================= 有効判定 ==============================
-// モード切替と個別スイッチを合成し、最終的にTRD/RNGを稼働させるかを返す。
-// 「一つのパラメータで両モジュールを切り替えたい」という要件を満たすため、
-// InpModuleSwitch を優先しつつ個別の InpEnableXXX も尊重する二段階判定にする。
+// モード切替のみで最終的にTRD/RNGを稼働させるかを返す。
+// 以前は個別スイッチ（InpEnableTRD/RNG）と併用していたが、
+// InpModuleSwitch の導入で役割が重複したため、モード1本に統一する。
 bool IsTRDEnabled()
 {
-   // まず個別スイッチがfalseなら即停止（旧来の挙動との後方互換を確保）
-   if(!InpEnableTRD) return false;
-
-   // 運用モードに応じて最終的な稼働可否を返す
+   // 運用モードのみでTRD可否を判断（スイッチ削減で設定ミスを防ぐ）
    switch(InpModuleSwitch)
    {
       case MODE_BOTH:     return true;  // 両方稼働
@@ -189,9 +218,7 @@ bool IsTRDEnabled()
 
 bool IsRNGEnabled()
 {
-   // 個別スイッチによる明示的な停止を尊重
-   if(!InpEnableRNG) return false;
-
+   // 運用モードのみでRNG可否を判断（単一入力で混乱を避ける）
    switch(InpModuleSwitch)
    {
       case MODE_BOTH:     return true;  // 両方稼働
@@ -748,7 +775,9 @@ void ManagePositionExit_RNG(Regime cur)
 
    // 4) 最大保有時間
    datetime etime = (datetime)PositionGetInteger(POSITION_TIME);
-   int heldMin = (int)MathFloor((TimeCurrent() - etime)/60.0);
+   // サーバー現在時刻はGetServerTime()から取得し、TimeCurrent/TimeTradeServerが片方未定義でも
+   // ビルドできるようにする（できる限りサーバー基準で経過時間を測る）。
+   int heldMin = (int)MathFloor((GetServerTime() - etime)/60.0);
    if(heldMin >= InpMaxHold_Min) doExit=true;
 
    if(doExit)
@@ -768,13 +797,18 @@ void ManagePositionExit_RNG(Regime cur)
 // MQL5 はラムダ式をサポートしないため、局所関数化ではなく専用の
 // ヘルパー関数に切り出して再利用する。ログ量はデバッグ時のみ有効。
 // hourJST を渡すのは時間帯不一致の原因を切り分けるため（-1は不明を示す）。
-void LogRngSkip(const string reason, double zVal, double vrVal, double ouVal, Regime cur, int hourJST=-1)
+// isSkip=false の場合は「情報」を示すインフォログとして扱い、スキップ扱いではないことを明確にする。
+// vrThr/bbwThr は「どのしきい値で落ちたか」を明示して誤設定を早期に検知するために追加している。
+void LogRngSkip(const string reason, double zVal, double vrVal, double ouVal, Regime cur, int hourJST=-1, double ouMin=-1.0, double ouMax=-1.0, bool isSkip=true, double vrThr=-1.0, double bbwThr=-1.0)
 {
    if(!InpRngDebugLog) return; // デバッグ無効ならログも抑止
 
    // 時刻・z/VR/OU・レジーム・保有状況をまとめて可視化することで、
    // 「どこで条件が落ちたか」を後から追跡しやすくする。
-   PrintFormat("RNGDBG skip: %s hourJST=%d mode=%d regime=%s pos=%s pend(B/S)=%d/%d z=%.3f VR=%.3f OU=%.1f",
+   string prefix = isSkip?"RNGDBG skip:" : "RNGDBG info:";
+   // VR/BBWのしきい値を明示し、入力値の誤りや意図しない最適化設定をすぐに発見できるようにする。
+   PrintFormat("%s %s hourJST=%d mode=%d regime=%s pos=%s pend(B/S)=%d/%d z=%.3f VR=%.3f(Thr=%.3f) OU=%.1f OUwin=[%.1f..%.1f] BBWThr=%.3f",
+               prefix,
                reason,
                hourJST,
                (int)InpModuleSwitch,
@@ -784,31 +818,60 @@ void LogRngSkip(const string reason, double zVal, double vrVal, double ouVal, Re
                CountPendingByTagPrefix("RNG_SELLLIMIT"),
                zVal,
                vrVal,
-               ouVal);
+               vrThr,
+               ouVal,
+               ouMin,
+               ouMax,
+               bbwThr);
 }
 
 //====================================================================
 void TryPlaceMeanRevertLimits(Regime cur)
 {
+   // OUレンジはログ表示と判定双方で使うため、最初に確定させて値を保持する
+   // （RNG専用モードの時間帯バイパス時にも [-1..-1] とならないよう明示的に渡す）。
+   double ouMin = MathMin((double)InpOU_Min, (double)InpOU_Max); // 入力の大小が逆でも下限に収束
+   double ouMax = MathMax((double)InpOU_Min, (double)InpOU_Max); // 同上（上限）
+   double ouTol = 1e-6; // 微小な浮動小数誤差で閾値を跨いだと見なされるのを防止
+
    // 時間帯（JST）判定
    int hourJST = CurrentHourJST();
    bool inHours=false;
-   if(InpAllowedStartJST <= InpAllowedEndJST)
+
+   // RNG専用モードでは「夜間のみ」という制限で発注ゼロになるのを防ぐため、
+   // 時間帯フィルタ自体をスキップする。TRD併用時だけ従来の窓を適用する。
+   bool enforceHours = (InpModuleSwitch != MODE_RNG_ONLY);
+   bool hoursBypassed = false; // trueなら後段でインフォログを1回だけ残す
+   if(enforceHours)
    {
-      // 一般的な範囲指定（例:17→24）。終端が24の場合、JST 0時も許容する。
-      inHours = (hourJST >= InpAllowedStartJST && hourJST <= InpAllowedEndJST);
-      if(InpAllowedEndJST==24 && hourJST==0) inHours=true; // 仕様の{17..23,0}を忠実に再現
+      // 通常の時間帯判定ロジック（従来挙動）
+      if(InpAllowedStartJST <= InpAllowedEndJST)
+      {
+         // 一般的な範囲指定（例:17→24）。終端が24の場合、JST 0時も許容する。
+         inHours = (hourJST >= InpAllowedStartJST && hourJST <= InpAllowedEndJST);
+         if(InpAllowedEndJST==24 && hourJST==0) inHours=true; // 仕様の{17..23,0}を忠実に再現
+      }
+      else
+      {
+         // 開始>終了のラップ指定（例:22→6 等）
+         inHours = (hourJST >= InpAllowedStartJST || hourJST <= InpAllowedEndJST);
+      }
+
+      if(!inHours)
+      {
+         // 時間帯不一致の場合は計算済みhourJSTを残し、ずれの原因を追いやすくする
+         // 時間帯不一致であっても、VR/BBWのしきい値を併記することで設定値との不整合を後から検知できるようにする
+         LogRngSkip("hour_out_of_range", lastZ_forTrigger, 0.0, 0.0, cur, hourJST, ouMin, ouMax, true, InpVR_Thr, InpRngUseBBW?InpBBW2ATR:-1.0);
+         return;
+      }
    }
    else
    {
-      // 開始>終了のラップ指定（例:22→6 等）
-      inHours = (hourJST >= InpAllowedStartJST || hourJST <= InpAllowedEndJST);
-   }
-   if(!inHours)
-   {
-      // 時間帯不一致の場合は計算済みhourJSTを残し、ずれの原因を追いやすくする
-      LogRngSkip("hour_out_of_range", lastZ_forTrigger, 0.0, 0.0, cur, hourJST);
-      return;
+      // RNG専用モードは24時間許容。スキップではなく「バイパスした」事実をログに残し
+      // つつ、OUレンジを明示して [-1..-1] にならないよう可視化する。メトリクスを計測
+      // した後にインフォログとして1回だけ出力することで、ゼロ値による誤解を避ける。
+      inHours=true;
+      hoursBypassed=true;
    }
 
    // 指標（確定M1）
@@ -816,17 +879,44 @@ void TryPlaceMeanRevertLimits(Regime cur)
    double z, vr, ou;
    if(!ComputeZ_VR_OU(sh, z, vr, ou))
    {
-      LogRngSkip("ComputeZ_VR_OU_failed", lastZ_forTrigger, 0.0, 0.0, cur, hourJST);
+      // 計算失敗時も入力しきい値を残し、データ欠損と設定値のどちらが原因かを切り分けやすくする
+      LogRngSkip("ComputeZ_VR_OU_failed", lastZ_forTrigger, 0.0, 0.0, cur, hourJST, ouMin, ouMax, true, InpVR_Thr, InpRngUseBBW?InpBBW2ATR:-1.0);
       return;
+   }
+
+   // 時間帯をバイパスした場合は、実計測値付きのインフォログをここで一度だけ出す。
+   // 「skip」ではなく「info」として明示し、RNG専用モードでは時間帯チェックが無効
+   // であることを後から見返しても理解できるようにする。
+   // RNG専用モードの時間帯バイパス情報は、1時間に1回だけ出力してログの氾濫を防ぎつつ、
+   // 「何時台に24時間化していたか」を後から追跡できるようにする。
+   // 日付と時間の両方をstaticで保持し、翌日同じ時刻になった場合も再度1回だけ出力する。
+   static int lastBypassHourLogged = -1;
+   static int lastBypassDayLogged  = -1;
+   // サーバー時刻から当日(JST換算前)の日付を取得。TimeCurrent()/TimeTradeServer()のどちらも
+   // 利用できない環境でビルドエラーにならないよう、関数化したGetServerTime()経由で取得する。
+   // hourJSTは別途オフセット補正済みなので、日付はサーバー日を基準にする。
+   int  curDay = (int)TimeCurrent();
+   bool needBypassInfoLog = (curDay != lastBypassDayLogged || hourJST != lastBypassHourLogged);
+   if(hoursBypassed && needBypassInfoLog)
+   {
+      // バイパス時は「info」扱いでVR/BBWのしきい値も併記し、24時間化している事実と閾値を1行で把握できるようにする
+      LogRngSkip("hour_filter_disabled_for_rng_only", z, vr, ou, cur, hourJST, ouMin, ouMax, false, InpVR_Thr, InpRngUseBBW?InpBBW2ATR:-1.0);
+      // 同一時間帯での連投を避けるため、最後に出力した日付と時刻（JSTの時）を更新して抑制する
+      lastBypassHourLogged = hourJST;
+      lastBypassDayLogged  = curDay;
    }
    if(vr > InpVR_Thr)
    {
-      LogRngSkip("VR_over", z, vr, ou, cur, hourJST);
+      // VR超過時も OUレンジとしきい値を併記し、入力の厳しさが原因かどうかを即座に判断できるようにする
+      LogRngSkip("VR_over", z, vr, ou, cur, hourJST, ouMin, ouMax, true, InpVR_Thr, InpRngUseBBW?InpBBW2ATR:-1.0);
       return;                        // VR上限超過ならボラ過多として除外（緩めた上限）
    }
-   if(!(ou >= InpOU_Min && ou <= InpOU_Max))
+   // OU判定は入力値の大小関係を自動修正し、浮動小数の誤差で弾かれないよう緩衝を設ける。
+   if(!(ou + ouTol >= ouMin && ou - ouTol <= ouMax))
    {
-      LogRngSkip("OU_out_of_range", z, vr, ou, cur, hourJST);
+      // 入力設定と実測OUを残して、なぜ弾かれたのかを後から検証しやすくする
+      // OUの下限/上限と一致しない場合は、設定レンジと実測値の両方をログに残して原因を可視化する
+      LogRngSkip("OU_out_of_range", z, vr, ou, cur, hourJST, ouMin, ouMax, true, InpVR_Thr, InpRngUseBBW?InpBBW2ATR:-1.0);
       return; // OUが許容レンジ外なら均衡不足として除外（幅を拡大）
    }
 
@@ -838,7 +928,9 @@ void TryPlaceMeanRevertLimits(Regime cur)
       double bbw = 4.0*STD_M1[sh]; // Bollinger ±2σ幅（上-下）。σが欠損するケースも考慮して簡潔に計算。
       if(bbw/atr > InpBBW2ATR)
       {
-         LogRngSkip("BBW_over", z, vr, ou, cur, hourJST);
+         // BB幅超過時もOUレンジを残し、時間帯・VR・OUのどこで落ちたかを同一フォーマットで追跡する
+         // BB幅超過時は、許容比と実測比のどちらが適切か後で判断できるようにしきい値も併記する
+         LogRngSkip("BBW_over", z, vr, ou, cur, hourJST, ouMin, ouMax, true, InpVR_Thr, InpRngUseBBW?InpBBW2ATR:-1.0);
          return;
       }
    }
@@ -861,7 +953,9 @@ void TryPlaceMeanRevertLimits(Regime cur)
    bool wantSell = (z >=  InpZ_in);
    if(!wantBuy && !wantSell)
    {
-      LogRngSkip("sign_not_strong_enough", z, vr, ou, cur, hourJST);
+      // 符号が弱く発注不可だったケースも OUレンジを含めて足並みを揃える
+      // 符号不足で撃たない場合も、他のしきい値と合わせて確認できるようにVR/BBWしきい値を残す
+      LogRngSkip("sign_not_strong_enough", z, vr, ou, cur, hourJST, ouMin, ouMax, true, InpVR_Thr, InpRngUseBBW?InpBBW2ATR:-1.0);
       return; // 閾値を跨いでいない場合（符号だけの小刻みな動き）はスキップ
    }
 
@@ -907,7 +1001,8 @@ void TryPlaceMeanRevertLimits(Regime cur)
    // BUY側の再アンカー可否判定
    if(wantBuy && pendingBuy>0)
    {
-      bool cooled = (TimeCurrent() - lastAnchorTimeBuy) >= (InpRngReanchorCooldown*60);
+      // GetServerTime()でサーバー時間を参照し、TimeCurrent()未定義エラーを避ける
+      bool cooled = (GetServerTime() - lastAnchorTimeBuy) >= (InpRngReanchorCooldown*60);
       double atrNow = ATR_M1[sh];
       double drift  = MathAbs(tk.bid - lastAnchorPriceBuy);
       bool drifted = (atrNow>0.0 && drift >= InpRngReanchorShiftATR*atrNow);
@@ -927,7 +1022,8 @@ void TryPlaceMeanRevertLimits(Regime cur)
    // SELL側の再アンカー可否判定
    if(wantSell && pendingSell>0)
    {
-      bool cooled = (TimeCurrent() - lastAnchorTimeSell) >= (InpRngReanchorCooldown*60);
+      // GetServerTime()でサーバー時間を参照し、TimeCurrent()未定義エラーを避ける
+      bool cooled = (GetServerTime() - lastAnchorTimeSell) >= (InpRngReanchorCooldown*60);
       double atrNow = ATR_M1[sh];
       double drift  = MathAbs(tk.ask - lastAnchorPriceSell);
       bool drifted = (atrNow>0.0 && drift >= InpRngReanchorShiftATR*atrNow);
@@ -962,13 +1058,15 @@ void TryPlaceMeanRevertLimits(Regime cur)
          double sl = 0.0;
          if(InpRNG_UseSL && rngSL>0.0) sl = price - rngSL; // BuyLimitのSLは下側
 
-         datetime exp = TimeCurrent() + (InpRngExpiryBars*60); // 有効期限を設定し、再発注の余地を作る
+         // GetServerTime()で有効期限の基準時刻を取得（TimeCurrent未定義によるビルド失敗を回避）
+         datetime exp = GetServerTime() + (InpRngExpiryBars*60); // 有効期限を設定し、再発注の余地を作る
          bool ok = Trade.BuyLimit(vol, price, sym, sl, 0.0, ORDER_TIME_SPECIFIED, exp, "RNG_BUYLIMIT");
          if(!ok) Print("RNG BuyLimit失敗:", _LastError);
       }
       // 最後に基準価格と時刻を更新（再アンカー判定用）
       lastAnchorPriceBuy = tk.bid;
-      lastAnchorTimeBuy  = TimeCurrent();
+      // 再アンカー時刻もサーバー時計(TimeTradeServer)で記録する（マクロ経由で未定義エラーを防ぐ）
+      lastAnchorTimeBuy  = GetServerTime();
       if(InpRngDebugLog)
          PrintFormat("RNGDBG buy_placed base=%.5f step=%.5f ladder=%d lot1=%.2f lot2=%.2f", base, step, ladder, lot1, lot2);
    }
@@ -996,12 +1094,14 @@ void TryPlaceMeanRevertLimits(Regime cur)
          double sl = 0.0;
          if(InpRNG_UseSL && rngSL>0.0) sl = price + rngSL; // SellLimitのSLは上側
 
-         datetime exp = TimeCurrent() + (InpRngExpiryBars*60);
+         // GetServerTime()で有効期限の基準時刻を取得（TimeCurrent未定義対策）
+         datetime exp = GetServerTime() + (InpRngExpiryBars*60);
          bool ok = Trade.SellLimit(vol, price, sym, sl, 0.0, ORDER_TIME_SPECIFIED, exp, "RNG_SELLLIMIT");
          if(!ok) Print("RNG SellLimit失敗:", _LastError);
       }
       lastAnchorPriceSell = tk.ask;
-      lastAnchorTimeSell  = TimeCurrent();
+      // 再アンカー時刻もサーバー時計(TimeTradeServer)で記録する（マクロ経由で未定義を回避）
+      lastAnchorTimeSell  = GetServerTime();
       if(InpRngDebugLog)
          PrintFormat("RNGDBG sell_placed base=%.5f step=%.5f ladder=%d lot1=%.2f lot2=%.2f", base, step, ladder, lot1, lot2);
    }
@@ -1067,13 +1167,14 @@ bool ComputeZ_VR_OU(int sh, double &z, double &vr, double &ou_time)
    return true;
 }
 
-//============================= JST現在時 ============================
-// ブローカー時刻（TimeCurrent）→ オフセットでUTC → JST(+9) へ変換して hour を返す。
-// 自動オフセットが不正確なブローカーもあるため、auto→手動の順で安全にフォールバックする。
-//====================================================================
-int CurrentHourJST()
-{
-   datetime nowSrv = TimeCurrent();
+  //============================= JST現在時 ============================
+  // ブローカー時刻（TimeTradeServer）→ オフセットでUTC → JST(+9) へ変換して hour を返す。
+  // 自動オフセットが不正確なブローカーもあるため、auto→手動の順で安全にフォールバックする。
+  //====================================================================
+  int CurrentHourJST()
+  {
+   // サーバー現在時刻をGetServerTime()で取得し、TimeCurrent/TimeTradeServerいずれか未定義の環境でもビルドできるようにする
+   datetime nowSrv = GetServerTime();
 
    // 1) サーバー→UTCのオフセットを決定（自動取得→手動値の順で採用）
    //    TimeGMTOffset() は一部ブローカーで0を返す場合があるため、
