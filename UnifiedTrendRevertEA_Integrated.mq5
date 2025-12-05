@@ -724,41 +724,48 @@ bool AnyOpenPosition()
 void CancelAllPendings()
 {
    int total=OrdersTotal();
-   for(int i=total-1; i>=0; --i)
-   {
-      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
-      if(OrderGetInteger(ORDER_MAGIC)!=InpMagic) continue;
-      if(OrderGetString(ORDER_SYMBOL)!=sym)      continue;
+    for(int i=total-1; i>=0; --i)
+    {
+       // MQL5ではOrderSelectはチケット番号のみを受け取るため、先にインデックスからチケットを取得する
+       // OrderGetTicketは現在のオーダープール(MODE_TRADES相当)に存在するオーダーのチケットを返す
+       ulong ticket = OrderGetTicket(i);
+       if(ticket==0)               continue; // 無効チケットをスキップ
+       if(!OrderSelect(ticket))    continue; // チケットに紐付くオーダーがなければ次へ
+       if(OrderGetInteger(ORDER_MAGIC)!=InpMagic) continue; // EA専用のマジック番号でなければ対象外
+       if(OrderGetString(ORDER_SYMBOL)!=sym)      continue; // 他シンボルの注文は削除しない
 
-      int type=(int)OrderGetInteger(ORDER_TYPE);
-      if(type==ORDER_TYPE_BUY_LIMIT || type==ORDER_TYPE_SELL_LIMIT ||
-         type==ORDER_TYPE_BUY_STOP  || type==ORDER_TYPE_SELL_STOP )
-      {
-         ulong ticket=(ulong)OrderGetInteger(ORDER_TICKET);
-         Trade.OrderDelete(ticket);
-      }
-   }
+       int type=(int)OrderGetInteger(ORDER_TYPE);
+       // 指値・逆指値のみ削除対象とし、成行注文への影響を防ぐ
+       if(type==ORDER_TYPE_BUY_LIMIT || type==ORDER_TYPE_SELL_LIMIT ||
+          type==ORDER_TYPE_BUY_STOP  || type==ORDER_TYPE_SELL_STOP )
+       {
+          Trade.OrderDelete(ticket); // 選択済みのチケットを削除
+       }
+    }
 }
 
 void CancelAllPendingsByTag(const string tag)
 {
    int total=OrdersTotal();
-   for(int i=total-1; i>=0; --i)
-   {
-      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
-      if(OrderGetInteger(ORDER_MAGIC)!=InpMagic) continue;
-      if(OrderGetString(ORDER_SYMBOL)!=sym)      continue;
+    for(int i=total-1; i>=0; --i)
+    {
+       // チケット取得→選択の順で処理することで、MQL5のOrderSelect仕様に適合させる
+       ulong ticket = OrderGetTicket(i);
+       if(ticket==0)               continue; // 取得失敗時はスキップ
+       if(!OrderSelect(ticket))    continue; // 選択不可の場合は次へ
+       if(OrderGetInteger(ORDER_MAGIC)!=InpMagic) continue; // 他EA/手動注文を除外
+       if(OrderGetString(ORDER_SYMBOL)!=sym)      continue; // シンボル違いを除外
 
-      string c = OrderGetString(ORDER_COMMENT);
-      if(StringFind(c, tag, 0) == 0)
-      {
-         int type=(int)OrderGetInteger(ORDER_TYPE);
-         if(type==ORDER_TYPE_BUY_LIMIT || type==ORDER_TYPE_SELL_LIMIT ||
-            type==ORDER_TYPE_BUY_STOP  || type==ORDER_TYPE_SELL_STOP )
-         {
-            ulong ticket=(ulong)OrderGetInteger(ORDER_TICKET);
-            Trade.OrderDelete(ticket);
-         }
-      }
-   }
+       string c = OrderGetString(ORDER_COMMENT);
+       // コメントの先頭に指定タグが含まれる注文のみ削除対象
+       if(StringFind(c, tag, 0) == 0)
+       {
+          int type=(int)OrderGetInteger(ORDER_TYPE);
+          if(type==ORDER_TYPE_BUY_LIMIT || type==ORDER_TYPE_SELL_LIMIT ||
+             type==ORDER_TYPE_BUY_STOP  || type==ORDER_TYPE_SELL_STOP )
+          {
+             Trade.OrderDelete(ticket); // タグ一致の指値・逆指値を削除
+          }
+       }
+    }
 }
