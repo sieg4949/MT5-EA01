@@ -1,8 +1,8 @@
 //+------------------------------------------------------------------+
 //|                                  UnifiedTrendRevertEA_Integrated.mq5
 //|  概要：H1の回帰β×σ（48本）でTRD/RNGを自動判定（ヒステリシス）。
-//|        ・TRD：M5ブレイクアウト（HH/LL=6本, Edge≥0.60, 逆指値, EntryBuffer=0.10×ATR(M5)）
-//|        ・RNG：M1平均回帰（PF-extreme準拠：|z|≥1.75, VR≤1.02, OU∈[8,60], 時間帯, 指値）
+//|        ・TRD：M5ブレイクアウト（HH/LL=6本, Edge≥0.85, 逆指値, EntryBuffer=0.28×ATR(M5)）
+//|        ・RNG：M1平均回帰（PF-extreme準拠：|z|≥1.60, VR≤1.05, OU∈[6,90], 時間帯, 指値）
 //|        出口は各モジュールのルール＋保険SL（H1ピボット±ATR余剰、ATRキャップ=3.0×ATR(H1)）。
 //|  重要：すべての判定は確定バー（shift=1）の値で行う。売買はCTradeを使用。
 //|  本版の改善点（セルフレビュー反映）:
@@ -25,10 +25,20 @@ input double InpEnterCoef         = 0.0022;   // TRD入り： |β| ≥ σ×Enter
 input double InpExitCoef          = 0.0018;   // RNG戻り： |β| ≤ σ×ExitCoef
 input double InpNoHysCoef         = 0.0020;   // ヒステリシスOFF時の単一しきい値
 
+// ■モジュール全体のON/OFFを一括で切り替える入力（TRD/RNGを一つの設定で管理）
+enum InpModuleMode
+{
+   MODE_BOTH     = 0, // TRDとRNGの両方を稼働
+   MODE_TRD_ONLY = 1, // TRDのみ稼働（RNGは停止）
+   MODE_RNG_ONLY = 2, // RNGのみ稼働（TRDは停止）
+   MODE_ALL_OFF  = 3  // すべて停止（監視のみ）
+};
+input InpModuleMode InpModuleSwitch = MODE_BOTH; // 運用モード切替
+
 // ■TRD（ブレイクアウト）
 input bool   InpEnableTRD         = true;     // TRDモジュール有効
-input double InpEntryBufferATR    = 0.10;     // 逆指値バッファ（ATR(M5)×倍率）
-input double InpEdgeEntryMin      = 0.60;     // Edgeエントリ下限（0..1）
+input double InpEntryBufferATR    = 0.28;     // 逆指値バッファ（ATR(M5)×倍率）※0.25-0.30で精度重視、ダマシ除去目的で距離を広げる
+input double InpEdgeEntryMin      = 0.85;     // Edgeエントリ下限（0..1）※強トレンドのみ狙うため0.85で精度優先に設定
 input int    InpHHLL_Lookback     = 6;        // HH/LL の参照本数（M5）
 input int    InpEMA_Fast          = 20;       // Edge用EMA（M5）
 input int    InpRSI_Period        = 3;        // RSI3（M5）
@@ -40,23 +50,35 @@ input double InpEDGE_Thresh       = 0.28;     // Edge EXITしきい値
 input int    InpEDGE_Consec       = 3;        // Edge EXIT連続本数
 
 // ■RNG（平均回帰）
-input bool   InpEnableRNG         = true;     // RNGモジュール有効
-input double InpZ_in              = 1.75;     // |z| ≥ Z_in で仕掛け
-input double InpZ_cut             = 3.0;      // |z| ≥ Z_cut で損切り
-input double InpVR_Thr            = 1.02;     // VR ≤ 1.02
-input int    InpOU_Min            = 8;        // OU 時間の下限
-input int    InpOU_Max            = 60;       // OU 時間の上限
-input double InpOffset_ATR        = 0.18;     // 指値オフセット = min(0.18×ATR(M1), 0.6×spread)
-input double InpOffset_Spread     = 0.6;      // 同上のスプレッド係数
-input int    InpAllowedStartJST   = 17;       // 取引時間（JST）の開始（例17）
-input int    InpAllowedEndJST     = 24;       // 取引時間（JST）の終了（例24→0時まで）
-input int    InpMaxHold_Min       = 60;       // 最大保有分数（RNG）
-input bool   InpRNG_UseSL         = false;    // RNGに任意SLを設定（既定OFF）
-input double InpRNG_SL_ATR_H1     = 2.0;      // RNG SL距離（×ATR(H1)）
+input bool   InpEnableRNG            = true;     // RNGモジュール有効
+input double InpZ_in                 = 2.00;     // |z|閾値（クロス／滞留トリガー共通）※2.0推奨（2.4→2.0で頻度↑）
+input int    InpZHoldBars            = 3;        // |z|が閾値以上に張り付いた場合の滞留本数トリガー
+input double InpZ_cut                = 3.0;      // |z| ≥ Z_cut で損切り
+input double InpVR_Thr               = 1.15;     // VR ≤ 1.15（ボラ許容を緩めて参入機会を増やす）
+input int    InpOU_Min               = 4;        // OU 時間の下限（超短期の均衡も許容してトリガーを拡大）
+input int    InpOU_Max               = 150;      // OU 時間の上限（長時間の停滞も許容してヒットを増やす）
+input bool   InpRngUseBBW            = true;     // BB幅判定を使うか（true推奨）
+input double InpBBW2ATR              = 1.10;     // BB幅/ATRの許容上限（0.8→1.1で“やや広いレンジ”でも許容）
+input double InpOffset_ATR           = 0.10;     // 指値オフセット = min(0.10×ATR(M1), 0.4×spread) として価格に寄せる
+input double InpOffset_Spread        = 0.4;      // 同上のスプレッド係数（安全側を確保しつつ控えめに寄せる）
+input int    InpRngExpiryBars        = 18;       // 指値の有効期限（M1本数）。短めに掃除して再発注機会を回す
+input int    InpRngReanchorCooldown  = 12;       // 再アンカーを許可する最短間隔（M1本数）。毎分置き直しを防止
+input double InpRngReanchorShiftATR  = 0.30;     // 前回アンカー基準からこれだけ乖離したら再アンカー許可（×ATR）
+input int    InpRngLadderCount       = 2;        // ラダー段数（1〜2）。2段まで許可して約定機会を増やす
+input double InpRngLadderStepATR     = 0.35;     // 段間隔（×ATR）。約0.35ATRずつ価格をずらして待つ
+input int    InpRngLadderPct1        = 50;       // 第1段のロット割合[%]。残りは2段目に割り当てる
+input int    InpAllowedStartJST      = 17;       // 取引時間（JST）の開始（例17）
+input int    InpAllowedEndJST        = 24;       // 取引時間（JST）の終了（例24→0時まで）
+input int    InpMaxHold_Min          = 60;       // 最大保有分数（RNG）
+input bool   InpRNG_UseSL            = false;    // RNGに任意SLを設定（既定OFF）
+input double InpRNG_SL_ATR_H1        = 2.0;      // RNG SL距離（×ATR(H1)）
+input bool   InpRngDebugLog          = false;    // RNGの判定経路を詳細ログ出力して原因調査を容易化（デフォルトOFF）
 
 // ■ブローカー時差
+//   TimeGMTOffset() で自動検出を試み、ズレがある場合は InpBrokerUTCOffsetHours を手動指定する。
 //   例: サーバーがUTC+2 → +2、UTC-3 → -3。これを使って UTC→JST(+9)補正を行う。
-input int    InpBrokerUTCOffsetHours = 0;
+input bool   InpAutoDetectBrokerOffset = true; // サーバーのUTCオフセットを自動検出して使うか（検出失敗時は手動値にフォールバック）
+input int    InpBrokerUTCOffsetHours   = 0;    // 自動が不正確な場合の上書き用。0は「そのまま」を意味しないことに注意
 
 // ■売買共通
 input double InpLots              = 0.10;     // ロット
@@ -89,13 +111,27 @@ double ATR_M5[], EMA20[], RSI3[];
 double ATR_H1[];
 double M1_close[], EMA_M1[], STD_M1[], ATR_M1[];
 
+// RNGの発火判定用の状態（クロス検出と滞留カウントを保持）
+double   lastZ_forTrigger = 0.0; // 直近M1バーのz値を保持し、閾値クロスを検出する
+int      zHoldCount       = 0;   // |z|が閾値以上に滞留した本数をカウント
+
+// RNGの再アンカー制御用。最後にアンカーした基準価格とバー時刻を方向別に保持
+double   lastAnchorPriceBuy  = 0.0;
+double   lastAnchorPriceSell = 0.0;
+datetime lastAnchorTimeBuy   = 0;
+datetime lastAnchorTimeSell  = 0;
+
 // バー更新記録
 datetime lastM5BarTime = 0;
 datetime lastM1BarTime = 0;
 
 // レジーム
 enum Regime { REG_RNG = 0, REG_TRD = 1 };
-Regime lastRegime = REG_RNG;   // ← ヒステリシス参照もこの値に統一
+Regime lastRegime = REG_RNG;        // ← ヒステリシス参照もこの値に統一
+
+// H1確定バー切替を記録し、レジーム変化バーでは新規エントリを禁止するためのフラグ
+datetime lastH1BarTime = 0;         // 直近H1バーの時刻
+bool     inhibitEntryThisH1Bar=false; // レジーム変化が発生したH1バー内ではtrue
 
 //=========================== 関 数 宣 言 =============================
 bool   CacheSeries();
@@ -108,6 +144,8 @@ bool   FindLastPivotLowBelow(double entryPrice, double &pivotLow);
 bool   FindLastPivotHighAbove(double entryPrice, double &pivotHigh);
 double CalcInitialSL(bool isBuy, double entry);
 
+double EdgeLong(int sh);                     // Edgeの方向別（ロング側強度）
+double EdgeShort(int sh);                    // Edgeの方向別（ショート側強度）
 void   ManagePositionExit_TRD();             // TRD EXIT（STRUCT/BURST/EDGE）
 void   TryPlaceBreakoutStops();              // TRD 逆指値
 
@@ -117,15 +155,60 @@ void   TryPlaceMeanRevertLimits(Regime cur); // RNG 指値
 bool   AnyOpenPosition();
 void   CancelAllPendings();
 void   CancelAllPendingsByTag(const string tag);
+bool   HasPendingByTag(const string tag);           // 指定タグの保留注文が存在するか確認
+int    CountPendingByTagPrefix(const string prefix); // 指定プレフィックスの保留件数を取得
+int    CountPendingBySubstring(const string needle); // コメントに部分一致する保留件数
+
+void   SelfReviewStatus(Regime regime, bool trdEnabled, bool rngEnabled, bool bothEnabled); // モード・レジーム状況のセルフチェック
 
 bool   ComputeZ_VR_OU(int sh, double &z, double &vr, double &ou_time);
 
 int    CurrentHourJST();                     // ブローカー時刻→UTC→JST(+9)
+bool   IsTRDEnabled();                       // モード＋個別入力を合成したTRD可否
+bool   IsRNGEnabled();                       // モード＋個別入力を合成したRNG可否
+
+//============================= 有効判定 ==============================
+// モード切替と個別スイッチを合成し、最終的にTRD/RNGを稼働させるかを返す。
+// 「一つのパラメータで両モジュールを切り替えたい」という要件を満たすため、
+// InpModuleSwitch を優先しつつ個別の InpEnableXXX も尊重する二段階判定にする。
+bool IsTRDEnabled()
+{
+   // まず個別スイッチがfalseなら即停止（旧来の挙動との後方互換を確保）
+   if(!InpEnableTRD) return false;
+
+   // 運用モードに応じて最終的な稼働可否を返す
+   switch(InpModuleSwitch)
+   {
+      case MODE_BOTH:     return true;  // 両方稼働
+      case MODE_TRD_ONLY: return true;  // TRDのみ稼働
+      case MODE_RNG_ONLY: return false; // RNG専用モードではTRD停止
+      case MODE_ALL_OFF:  return false; // 完全停止
+      default:            return false; // 想定外値は安全側で停止
+   }
+}
+
+bool IsRNGEnabled()
+{
+   // 個別スイッチによる明示的な停止を尊重
+   if(!InpEnableRNG) return false;
+
+   switch(InpModuleSwitch)
+   {
+      case MODE_BOTH:     return true;  // 両方稼働
+      case MODE_TRD_ONLY: return false; // TRD専用モードではRNG停止
+      case MODE_RNG_ONLY: return true;  // RNGのみ稼働
+      case MODE_ALL_OFF:  return false; // 完全停止
+      default:            return false; // 想定外値は安全側で停止
+   }
+}
 
 //============================= 初 期 化 ==============================
 int OnInit()
 {
    sym = _Symbol;
+
+   //--- H1バーの初期時刻を保持（レジーム変化バー検出に使用）
+   lastH1BarTime = iTime(sym, TF_H1, 0);
 
    //--- M5（TRD）
    hATR_M5 = iATR(sym, TF_M5, 14);
@@ -164,17 +247,87 @@ void OnTick()
    // 参照配列の更新（取得失敗なら抜け）
    if(!CacheSeries()) return;
 
+   // モードと個別入力を合成した有効/無効判定を先に取得しておく
+   bool trdEnabled = IsTRDEnabled();
+   bool rngEnabled = IsRNGEnabled();
+
+   // H1のバー更新を検出（レジーム変化バー判定に使用）
+   datetime curH1 = iTime(sym, TF_H1, 0);
+   bool newH1Bar  = (curH1 != lastH1BarTime);
+   if(newH1Bar)
+      lastH1BarTime = curH1;
+
    // H1ゲート（確定バーでβ×σ計算、ヒステリシスは lastRegime 参照）
-   Regime regime = CalcRegimeH1();
-   if(regime != lastRegime)
+   // ただしモジュールが片側しか有効でない場合はゲート計算をスキップして強制レジームへ固定する。
+   // さらに「強制レジーム固定」でヒステリシス抑止がかかり続けないよう、ゲート不使用時は
+   // 新規抑止フラグを解除して即座に発注できるようにする。
+   Regime regimeRaw;
+   bool bothEnabled = (trdEnabled && rngEnabled); // 両方稼働時のみゲートを計算
+   if(bothEnabled)
    {
-      PrintFormat("H1 Regime 変更: %s -> %s",
-                  lastRegime==REG_TRD?"TRD":"RNG",
-                  regime==REG_TRD?"TRD":"RNG");
-      // 状態遷移バーでは新規発注を抑制。安全のため保留注文は一旦全キャンセル。
-      CancelAllPendings();
-      lastRegime = regime;
+      // 本来のβ×σゲートを計算（ヒステリシス付き）
+      regimeRaw = CalcRegimeH1();
    }
+   else if(trdEnabled && !rngEnabled)
+   {
+      // TRD専用運用では常にTRD扱い。ゲートを見ないことで「RNGレジームで足止め」される事態を防ぐ。
+      regimeRaw = REG_TRD;
+   }
+   else if(!trdEnabled && rngEnabled)
+   {
+      // RNG専用運用では常にRNG扱い。TRDレジームに切り替わる要素を排除し、発注停止を防ぐ。
+      regimeRaw = REG_RNG;
+   }
+   else
+   {
+      // 全停止（MODE_ALL_OFFなど）では安全側でRNG固定。以降の判定は有効フラグで弾かれる。
+      regimeRaw = REG_RNG;
+   }
+
+   // TRD/RNGの有効フラグに応じて“運用上のレジーム”を上書きする
+   // ・TRD無効かつRNG有効: ゲートがTRDを示してもRNGを動かす（TRD停止時に0件になる問題を防止）
+   // ・RNG無効かつTRD有効: ゲートがRNGを示してもTRDを動かす（将来の片側無効化にも備える）
+   // ・両方有効/無効: ゲート結果をそのまま使用（無効時はそもそも発注しない）
+   // 一括モード(InpModuleSwitch)で上記の有効判定を作っている点に注意。
+   Regime regime = regimeRaw;
+   if(!trdEnabled && rngEnabled) regime = REG_RNG;
+   if(!rngEnabled && trdEnabled) regime = REG_TRD;
+
+   // ゲート計算を行った場合のみヒステリシス遷移と抑止を適用する。
+   // 片側固定モードでは「ゲート非使用＝遷移なし」とみなして抑止を解除し、
+   // 強制モードでも即時発注できるようにする。
+   if(bothEnabled)
+   {
+      // 生のゲート判定が変化した場合のみヒステリシス状態を更新し、遷移バー抑制をかける
+      // （上書き後のregimeは実際の発注判定に使用する）
+      if(regimeRaw != lastRegime)
+      {
+         PrintFormat("H1 Regime 変更: %s -> %s",
+                     lastRegime==REG_TRD?"TRD":"RNG",
+                     regimeRaw==REG_TRD?"TRD":"RNG");
+         // 状態遷移バーでは新規発注を抑制。安全のため保留注文は一旦全キャンセル。
+         CancelAllPendings();
+         lastRegime = regimeRaw;
+         inhibitEntryThisH1Bar = true;   // このH1バー内の新規エントリを抑制
+      }
+      else if(newH1Bar)
+      {
+         // レジーム変化が無ければ、次のバーから新規エントリを許可する
+         inhibitEntryThisH1Bar = false;
+      }
+   }
+   else
+   {
+      // ゲート非使用モードではヒステリシス遷移による抑止を発生させず、
+      // lastRegime を強制レジームに同期させて「永遠に遷移中」が起きないようにする。
+      lastRegime = regimeRaw;
+      inhibitEntryThisH1Bar = false; // 強制モードではバー跨ぎを待たずに発注を許可
+   }
+
+   // H1バー単位でセルフレビュー用の状態ダンプを出力し、
+   // 「モードとレジームが一致しているのに撃たない」などの調査を容易にする。
+   if(newH1Bar)
+      SelfReviewStatus(regime, trdEnabled, rngEnabled, bothEnabled);
 
    // ==== M5 新バー（TRDモジュール）====
    datetime curM5 = iTime(sym, TF_M5, 0);
@@ -186,7 +339,7 @@ void OnTick()
       ManagePositionExit_TRD();
 
       // TRD：新規逆指値（1ポジ制御・確定値判定）
-      if(InpEnableTRD && regime==REG_TRD && !AnyOpenPosition())
+      if(trdEnabled && regime==REG_TRD && !AnyOpenPosition() && !inhibitEntryThisH1Bar)
          TryPlaceBreakoutStops();
    }
 
@@ -200,7 +353,7 @@ void OnTick()
       ManagePositionExit_RNG(regime);
 
       // RNG：新規指値（1ポジ制御・確定値判定）
-      if(InpEnableRNG && regime==REG_RNG && !AnyOpenPosition())
+      if(rngEnabled && regime==REG_RNG && !AnyOpenPosition() && !inhibitEntryThisH1Bar)
          TryPlaceMeanRevertLimits(regime);
    }
 }
@@ -249,7 +402,7 @@ bool CacheSeries()
 }
 
 //============================= H1ゲート ==============================
-// 回帰傾きβと窓内σを求め、ヒステリシス（lastRegime）でTRD/RNGを安定切替。
+// 回帰傾きβと残差標準偏差σを求め、ヒステリシス（lastRegime）でTRD/RNGを安定切替。
 // すべて確定バー（shift=1）で評価。データ不足時は安全側（RNG）。
 //====================================================================
 Regime CalcRegimeH1()
@@ -283,7 +436,20 @@ Regime CalcRegimeH1()
    varY /= N;
 
    double beta  = (xVar>0.0 ? cov/xVar : 0.0);
-   double sigma = MathSqrt(varY);
+
+   // 回帰直線の切片と残差を用いた標準偏差を求める（β×σのσを厳密化）
+   double intercept = yMean - beta*xMean;
+   double residualSqSum = 0.0;
+   for(int r=0; r<N; ++r)
+   {
+      double xi = r;
+      double y  = H1_close[start - r];
+      double fit = intercept + beta*xi;
+      double resid = y - fit;
+      residualSqSum += resid*resid;
+   }
+   // 標本分散としてN-1で割り、安定化のためゼロ除算はガード
+   double sigma = (N>1 ? MathSqrt(residualSqSum/(N-1)) : 0.0);
 
    Regime cur;
    if(InpUseHysteresis)
@@ -328,6 +494,24 @@ double EdgeScore(int sh)
    }
 
    return 0.35*pos_norm + 0.25*slope_norm + 0.25*rsi_norm + 0.15*s;
+}
+
+//-------------------------------------------------------------------------
+// EdgeLong / EdgeShort
+// EdgeScore は「上方向が強いほど大きい（0..1）」指標のため、ショート側は
+// 対称性を保つよう (1 - EdgeScore) で弱さ→強さを測る。入口・出口ともに
+// 同一しきい値を使うことでロング/ショートの公平性を担保する。
+//-------------------------------------------------------------------------
+double EdgeLong(int sh)
+{
+   // ロング優位度をそのまま返す（0..1）
+   return EdgeScore(sh);
+}
+
+double EdgeShort(int sh)
+{
+   // ショート優位度は EdgeScore の鏡像で表現（0..1）。0.5 を境に対称。
+   return 1.0 - EdgeScore(sh);
 }
 
 //============================= HH/LL(M5) ============================
@@ -453,10 +637,12 @@ void ManagePositionExit_TRD()
    // 3) EDGE（弱化継続）
    if(!doExit)
    {
+      // 建玉方向ごとに「自方向エッジのみ」を監視し、連続で弱い場合に決済。
+      // MathMax で片側の強さに引っ張られないよう、左右対称の判定にする。
       bool under=true;
       for(int k=0;k<InpEDGE_Consec;k++)
       {
-         double e = EdgeScore(sh+k);
+         double e = (type==POSITION_TYPE_BUY) ? EdgeLong(sh+k) : EdgeShort(sh+k);
          if(e >= InpEDGE_Thresh){ under=false; break; }
       }
       if(under) doExit=true;
@@ -479,8 +665,14 @@ void TryPlaceBreakoutStops()
    CancelAllPendingsByTag("TRD_");
 
    int sh = 1;
-   double edge = EdgeScore(sh);
-   if(edge < InpEdgeEntryMin) return;
+   // ロング/ショートで同一しきい値を用いるが、方向専用のエッジを使うことで
+   // 判定を完全に左右対称にする。
+   double edgeL = EdgeLong(sh);
+   double edgeS = EdgeShort(sh);
+   // 直近2本連続で方向エッジがしきい値以上かを確認し、
+   // 「瞬間的な尖り」を排除して強いトレンドのみを通す
+   bool allowLong  = (edgeL >= InpEdgeEntryMin && EdgeLong(sh+1)  >= InpEdgeEntryMin);
+   bool allowShort = (edgeS >= InpEdgeEntryMin && EdgeShort(sh+1) >= InpEdgeEntryMin);
 
    double hh,ll;
    if(!GetHHLL(sh, hh, ll)) return;
@@ -502,8 +694,8 @@ void TryPlaceBreakoutStops()
    Trade.SetExpertMagicNumber(InpMagic);
    Trade.SetDeviationInPoints(InpSlippage);
 
-   // BUY STOP：close>HH → BuyStop=HH+buf
-   if(c > hh)
+   // BUY STOP：close>HH かつ ロング側エッジがしきい値以上 → BuyStop=HH+buf
+   if(c > hh && allowLong)
    {
       double price = NormalizeDouble(hh + buf, digits);
       // 最小距離（stop/freeze）を確保
@@ -513,8 +705,8 @@ void TryPlaceBreakoutStops()
       bool ok = Trade.BuyStop(InpLots, price, sym, sl, 0.0, ORDER_TIME_GTC, 0, "TRD_BUYSTOP");
       if(!ok) Print("BuyStop失敗:", _LastError);
    }
-   // SELL STOP：close<ll → SellStop=LL-buf
-   else if(c < ll)
+   // SELL STOP：close<ll かつ ショート側エッジがしきい値以上 → SellStop=LL-buf
+   else if(c < ll && allowShort)
    {
       double price = NormalizeDouble(ll - buf, digits);
       if(minPts>0 && (tk.bid - price) < minPts*pt) price = tk.bid - minPts*pt;
@@ -567,31 +759,111 @@ void ManagePositionExit_RNG(Regime cur)
 }
 
 //============================= RNG 指値 =============================
-// 時間帯（JST）・VR・OU・|z|を満たした場合に BuyLimit / SellLimit を設置。
-// 価格は offset = min(0.18×ATR(M1), 0.6×spread)。STOP/FREEZE距離を確保。
+// 時間帯（JST）・VR・OUを満たしたうえで、|z|閾値のクロス／滞留トリガーを検出して
+// BuyLimit / SellLimit を設置する。ラダー（最大2段）、期限付き再アンカー、
+// BB幅判定を追加し、「撃たなすぎ」を解消しながら無駄打ちを抑制する。
 // 任意SL（InpRNG_UseSL=true）時は H1 ATR に対する±距離でSL設定。
+//====================================================================
+// RNGのスキップ理由を詳細に残す専用ロガー。
+// MQL5 はラムダ式をサポートしないため、局所関数化ではなく専用の
+// ヘルパー関数に切り出して再利用する。ログ量はデバッグ時のみ有効。
+// hourJST を渡すのは時間帯不一致の原因を切り分けるため（-1は不明を示す）。
+void LogRngSkip(const string reason, double zVal, double vrVal, double ouVal, Regime cur, int hourJST=-1)
+{
+   if(!InpRngDebugLog) return; // デバッグ無効ならログも抑止
+
+   // 時刻・z/VR/OU・レジーム・保有状況をまとめて可視化することで、
+   // 「どこで条件が落ちたか」を後から追跡しやすくする。
+   PrintFormat("RNGDBG skip: %s hourJST=%d mode=%d regime=%s pos=%s pend(B/S)=%d/%d z=%.3f VR=%.3f OU=%.1f",
+               reason,
+               hourJST,
+               (int)InpModuleSwitch,
+               (cur==REG_TRD?"TRD":"RNG"),
+               AnyOpenPosition()?"YES":"NO",
+               CountPendingByTagPrefix("RNG_BUYLIMIT"),
+               CountPendingByTagPrefix("RNG_SELLLIMIT"),
+               zVal,
+               vrVal,
+               ouVal);
+}
+
 //====================================================================
 void TryPlaceMeanRevertLimits(Regime cur)
 {
-   // RNG系保留を先に削除（置き直し）
-   CancelAllPendingsByTag("RNG_");
-
    // 時間帯（JST）判定
    int hourJST = CurrentHourJST();
    bool inHours=false;
    if(InpAllowedStartJST <= InpAllowedEndJST)
+   {
+      // 一般的な範囲指定（例:17→24）。終端が24の場合、JST 0時も許容する。
       inHours = (hourJST >= InpAllowedStartJST && hourJST <= InpAllowedEndJST);
+      if(InpAllowedEndJST==24 && hourJST==0) inHours=true; // 仕様の{17..23,0}を忠実に再現
+   }
    else
+   {
+      // 開始>終了のラップ指定（例:22→6 等）
       inHours = (hourJST >= InpAllowedStartJST || hourJST <= InpAllowedEndJST);
-   if(!inHours) return;
+   }
+   if(!inHours)
+   {
+      // 時間帯不一致の場合は計算済みhourJSTを残し、ずれの原因を追いやすくする
+      LogRngSkip("hour_out_of_range", lastZ_forTrigger, 0.0, 0.0, cur, hourJST);
+      return;
+   }
 
    // 指標（確定M1）
    int sh=1;
    double z, vr, ou;
-   if(!ComputeZ_VR_OU(sh, z, vr, ou)) return;
-   if(vr > InpVR_Thr) return;
-   if(!(ou >= InpOU_Min && ou <= InpOU_Max)) return;
-   if(MathAbs(z) < InpZ_in) return;
+   if(!ComputeZ_VR_OU(sh, z, vr, ou))
+   {
+      LogRngSkip("ComputeZ_VR_OU_failed", lastZ_forTrigger, 0.0, 0.0, cur, hourJST);
+      return;
+   }
+   if(vr > InpVR_Thr)
+   {
+      LogRngSkip("VR_over", z, vr, ou, cur, hourJST);
+      return;                        // VR上限超過ならボラ過多として除外（緩めた上限）
+   }
+   if(!(ou >= InpOU_Min && ou <= InpOU_Max))
+   {
+      LogRngSkip("OU_out_of_range", z, vr, ou, cur, hourJST);
+      return; // OUが許容レンジ外なら均衡不足として除外（幅を拡大）
+   }
+
+   // BB幅によるレンジ確認（幅/ATR <= InpBBW2ATR）。幅が広すぎる場合は“レンジに見えない”ので見送り。
+   if(InpRngUseBBW)
+   {
+      double atr = ATR_M1[sh];
+      if(atr<=0.0) return;
+      double bbw = 4.0*STD_M1[sh]; // Bollinger ±2σ幅（上-下）。σが欠損するケースも考慮して簡潔に計算。
+      if(bbw/atr > InpBBW2ATR)
+      {
+         LogRngSkip("BBW_over", z, vr, ou, cur, hourJST);
+         return;
+      }
+   }
+
+   // zトリガー：クロス（|z|が閾値を跨ぐ瞬間）か、閾値以上に張り付いた滞留（N本連続）で1回だけ発火させる
+   bool zCross = (MathAbs(lastZ_forTrigger) < InpZ_in && MathAbs(z) >= InpZ_in);
+   if(MathAbs(z) >= InpZ_in) zHoldCount++; else zHoldCount=0;
+   bool zHold = (zHoldCount >= InpZHoldBars);
+   lastZ_forTrigger = z; // 次回のクロス検出用に保持
+
+   if(!(zCross || zHold))
+   {
+      if(InpRngDebugLog)
+         PrintFormat("RNGDBG wait_trigger z=%.3f last=%.3f hold=%d cross=%s holdTrig=%s", z, lastZ_forTrigger, zHoldCount, zCross?"Y":"N", zHold?"Y":"N");
+      return; // どちらのトリガーも満たさない場合は発注しない
+   }
+
+   // 方向決定：zがマイナス側ならBUY、プラス側ならSELL。絶対値で間引いた後に符号で分岐する。
+   bool wantBuy  = (z <= -InpZ_in);
+   bool wantSell = (z >=  InpZ_in);
+   if(!wantBuy && !wantSell)
+   {
+      LogRngSkip("sign_not_strong_enough", z, vr, ou, cur, hourJST);
+      return; // 閾値を跨いでいない場合（符号だけの小刻みな動き）はスキップ
+   }
 
    // 価格要素
    MqlTick tk; SymbolInfoTick(sym, tk);
@@ -602,6 +874,8 @@ void TryPlaceMeanRevertLimits(Regime cur)
    double minPts = MathMax(stops, freeze);
 
    double spread = tk.ask - tk.bid;
+   // オフセットを小さく保ちながら、閾値判定が出た時点の価格を基準にラダーを組む。
+   // ここで得た offset はラダー全段の基準位置（段差はATR倍率で加算/減算）。
    double offAtr = InpOffset_ATR * ATR_M1[sh];
    double offSpr = InpOffset_Spread * spread;
    double offset = (offAtr < offSpr ? offAtr : offSpr);
@@ -615,33 +889,125 @@ void TryPlaceMeanRevertLimits(Regime cur)
    Trade.SetExpertMagicNumber(InpMagic);
    Trade.SetDeviationInPoints(InpSlippage);
 
-   // z<=-Z_in → BUY LIMIT（bid - offset）
-   if(z <= -InpZ_in)
+   // ラダー段数とロット配分を計算（段数は1〜2にクリップ）。過剰発注を防ぎつつ機会を増やす。
+   int ladder = MathMax(1, MathMin(2, InpRngLadderCount));
+   double lot1=InpLots, lot2=0.0;
+   if(ladder==2)
    {
-      double price = NormalizeDouble(tk.bid - offset, digits);
-      // STOP/FREEZE距離：現在のBidより下に置くので (tk.bid - price) >= minPts*pt
-      if(minPts>0 && (tk.bid - price) < minPts*pt)
-         price = tk.bid - minPts*pt;
-
-      double sl = 0.0;
-      if(InpRNG_UseSL && rngSL>0.0) sl = price - rngSL; // BuyLimitのSLは下側
-
-      bool ok = Trade.BuyLimit(InpLots, price, sym, sl, 0.0, ORDER_TIME_GTC, 0, "RNG_BUYLIMIT");
-      if(!ok) Print("RNG BuyLimit失敗:", _LastError);
+      lot1 = InpLots * (InpRngLadderPct1/100.0);
+      lot2 = InpLots - lot1;
    }
-   // z>=+Z_in → SELL LIMIT（ask + offset）
-   else if(z >= InpZ_in)
+
+   // ラダー再アンカー判定：同方向に既存指値があり、価格乖離＋クールダウンを満たす場合は一括で置き直す。
+   int pendingBuy  = CountPendingByTagPrefix("RNG_BUYLIMIT");
+   int pendingSell = CountPendingByTagPrefix("RNG_SELLLIMIT");
+   bool allowBuy  = wantBuy;
+   bool allowSell = wantSell;
+
+   // BUY側の再アンカー可否判定
+   if(wantBuy && pendingBuy>0)
    {
-      double price = NormalizeDouble(tk.ask + offset, digits);
-      // STOP/FREEZE距離：現在のAskより上に置くので (price - tk.ask) >= minPts*pt
-      if(minPts>0 && (price - tk.ask) < minPts*pt)
-         price = tk.ask + minPts*pt;
+      bool cooled = (TimeCurrent() - lastAnchorTimeBuy) >= (InpRngReanchorCooldown*60);
+      double atrNow = ATR_M1[sh];
+      double drift  = MathAbs(tk.bid - lastAnchorPriceBuy);
+      bool drifted = (atrNow>0.0 && drift >= InpRngReanchorShiftATR*atrNow);
+      if(cooled && drifted)
+      {
+         CancelAllPendingsByTag("RNG_BUYLIMIT"); // 方向限定で安全に置き直す
+         pendingBuy=0;
+      }
+      else
+      {
+         if(InpRngDebugLog)
+            PrintFormat("RNGDBG keep_buy_anchor cooled=%s drifted=%s drift=%.5f atr=%.5f", cooled?"Y":"N", drifted?"Y":"N", drift, atrNow);
+         allowBuy=false; // 条件未達なら既存を維持し、新規発注しない
+      }
+   }
 
-      double sl = 0.0;
-      if(InpRNG_UseSL && rngSL>0.0) sl = price + rngSL; // SellLimitのSLは上側
+   // SELL側の再アンカー可否判定
+   if(wantSell && pendingSell>0)
+   {
+      bool cooled = (TimeCurrent() - lastAnchorTimeSell) >= (InpRngReanchorCooldown*60);
+      double atrNow = ATR_M1[sh];
+      double drift  = MathAbs(tk.ask - lastAnchorPriceSell);
+      bool drifted = (atrNow>0.0 && drift >= InpRngReanchorShiftATR*atrNow);
+      if(cooled && drifted)
+      {
+         CancelAllPendingsByTag("RNG_SELLLIMIT");
+         pendingSell=0;
+      }
+      else
+      {
+         if(InpRngDebugLog)
+            PrintFormat("RNGDBG keep_sell_anchor cooled=%s drifted=%s drift=%.5f atr=%.5f", cooled?"Y":"N", drifted?"Y":"N", drift, atrNow);
+         allowSell=false;
+      }
+   }
 
-      bool ok = Trade.SellLimit(InpLots, price, sym, sl, 0.0, ORDER_TIME_GTC, 0, "RNG_SELLLIMIT");
-      if(!ok) Print("RNG SellLimit失敗:", _LastError);
+   // BUYラダー配置
+   if(allowBuy && pendingBuy<ladder)
+   {
+      double base = NormalizeDouble(tk.bid - offset, digits); // 基準アンカー
+      double step = InpRngLadderStepATR * ATR_M1[sh];
+      for(int i=0; i<ladder; ++i)
+      {
+         double price = NormalizeDouble(base - i*step, digits); // BUYは下方向にずらす
+         // STOP/FREEZE距離：現在のBidより下に置くので (tk.bid - price) >= minPts*pt
+         if(minPts>0 && (tk.bid - price) < minPts*pt)
+            price = tk.bid - minPts*pt;
+
+         double vol = (i==0 ? lot1 : lot2);
+         if(vol <= 0.0) continue; // 0ロットは無意味なのでスキップ
+
+         double sl = 0.0;
+         if(InpRNG_UseSL && rngSL>0.0) sl = price - rngSL; // BuyLimitのSLは下側
+
+         datetime exp = TimeCurrent() + (InpRngExpiryBars*60); // 有効期限を設定し、再発注の余地を作る
+         bool ok = Trade.BuyLimit(vol, price, sym, sl, 0.0, ORDER_TIME_SPECIFIED, exp, "RNG_BUYLIMIT");
+         if(!ok) Print("RNG BuyLimit失敗:", _LastError);
+      }
+      // 最後に基準価格と時刻を更新（再アンカー判定用）
+      lastAnchorPriceBuy = tk.bid;
+      lastAnchorTimeBuy  = TimeCurrent();
+      if(InpRngDebugLog)
+         PrintFormat("RNGDBG buy_placed base=%.5f step=%.5f ladder=%d lot1=%.2f lot2=%.2f", base, step, ladder, lot1, lot2);
+   }
+   else if(InpRngDebugLog && wantBuy)
+   {
+      // 既存アンカー維持などでBUYを見送った理由を明示
+      PrintFormat("RNGDBG buy_skipped pending=%d ladder=%d allow=%s", pendingBuy, ladder, allowBuy?"Y":"N");
+   }
+
+   // SELLラダー配置
+   if(allowSell && pendingSell<ladder)
+   {
+      double base = NormalizeDouble(tk.ask + offset, digits);
+      double step = InpRngLadderStepATR * ATR_M1[sh];
+      for(int i=0; i<ladder; ++i)
+      {
+         double price = NormalizeDouble(base + i*step, digits); // SELLは上方向にずらす
+         // STOP/FREEZE距離：現在のAskより上に置くので (price - tk.ask) >= minPts*pt
+         if(minPts>0 && (price - tk.ask) < minPts*pt)
+            price = tk.ask + minPts*pt;
+
+         double vol = (i==0 ? lot1 : lot2);
+         if(vol <= 0.0) continue;
+
+         double sl = 0.0;
+         if(InpRNG_UseSL && rngSL>0.0) sl = price + rngSL; // SellLimitのSLは上側
+
+         datetime exp = TimeCurrent() + (InpRngExpiryBars*60);
+         bool ok = Trade.SellLimit(vol, price, sym, sl, 0.0, ORDER_TIME_SPECIFIED, exp, "RNG_SELLLIMIT");
+         if(!ok) Print("RNG SellLimit失敗:", _LastError);
+      }
+      lastAnchorPriceSell = tk.ask;
+      lastAnchorTimeSell  = TimeCurrent();
+      if(InpRngDebugLog)
+         PrintFormat("RNGDBG sell_placed base=%.5f step=%.5f ladder=%d lot1=%.2f lot2=%.2f", base, step, ladder, lot1, lot2);
+   }
+   else if(InpRngDebugLog && wantSell)
+   {
+      PrintFormat("RNGDBG sell_skipped pending=%d ladder=%d allow=%s", pendingSell, ladder, allowSell?"Y":"N");
    }
 }
 
@@ -702,12 +1068,27 @@ bool ComputeZ_VR_OU(int sh, double &z, double &vr, double &ou_time)
 }
 
 //============================= JST現在時 ============================
-// ブローカー時刻（TimeCurrent）→ 入力オフセットでUTC → JST(+9) へ変換して hour を返す。
+// ブローカー時刻（TimeCurrent）→ オフセットでUTC → JST(+9) へ変換して hour を返す。
+// 自動オフセットが不正確なブローカーもあるため、auto→手動の順で安全にフォールバックする。
 //====================================================================
 int CurrentHourJST()
 {
    datetime nowSrv = TimeCurrent();
-   datetime nowUTC = nowSrv - InpBrokerUTCOffsetHours*60*60;
+
+   // 1) サーバー→UTCのオフセットを決定（自動取得→手動値の順で採用）
+   //    TimeGMTOffset() は一部ブローカーで0を返す場合があるため、
+   //    自動値が0で明らかにズレている場合に備え手動値も残す。
+   double offsetHours = 0.0;
+   if(InpAutoDetectBrokerOffset)
+   {
+      offsetHours = TimeGMTOffset()/3600.0; // 秒→時間
+   }
+   // 自動値が0で、手動で非0を指定している場合は手動値を優先
+   if(MathAbs(offsetHours) < 1e-6 && InpBrokerUTCOffsetHours!=0)
+      offsetHours = InpBrokerUTCOffsetHours;
+
+   // 2) UTCに戻してからJST(+9)へ変換
+   datetime nowUTC = (datetime)(nowSrv - offsetHours*60.0*60.0);
    datetime nowJST = nowUTC + 9*60*60;
    MqlDateTime md; TimeToStruct(nowJST, md);
    return md.hour;
@@ -767,5 +1148,126 @@ void CancelAllPendingsByTag(const string tag)
              Trade.OrderDelete(ticket); // タグ一致の指値・逆指値を削除
           }
        }
-    }
+   }
+}
+
+// コメントに指定タグを含む保留注文が現在存在するかを確認するヘルパー
+// RNG指値の「毎M1置き直し」を避け、約定またはキャンセルまで据え置くために使用
+bool HasPendingByTag(const string tag)
+{
+   int total=OrdersTotal();
+   for(int i=0; i<total; ++i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket==0)               continue; // 無効チケットをスキップ
+      if(!OrderSelect(ticket))    continue; // 選択できない場合は次へ
+      if(OrderGetInteger(ORDER_MAGIC)!=InpMagic) continue; // 他EA/手動は除外
+      if(OrderGetString(ORDER_SYMBOL)!=sym)      continue; // 他シンボルは除外
+
+      int type=(int)OrderGetInteger(ORDER_TYPE);
+      // 成行ではなく保留注文のみを対象（指値・逆指値）
+      if(type!=ORDER_TYPE_BUY_LIMIT && type!=ORDER_TYPE_SELL_LIMIT &&
+         type!=ORDER_TYPE_BUY_STOP  && type!=ORDER_TYPE_SELL_STOP)
+         continue;
+
+      string c = OrderGetString(ORDER_COMMENT);
+      if(StringFind(c, tag, 0) >= 0) return true; // タグを含めば存在
+   }
+   return false; // 見つからなければ未設置
+}
+
+// コメントの先頭が指定プレフィックスで始まる保留注文（指値/逆指値）の件数を返すヘルパー
+// RNGのラダー制御で「同方向に何本残っているか」を数えるために使用する
+int CountPendingByTagPrefix(const string prefix)
+{
+   int total=OrdersTotal();
+   int cnt=0;
+   for(int i=0; i<total; ++i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket==0)               continue;
+      if(!OrderSelect(ticket))    continue;
+      if(OrderGetInteger(ORDER_MAGIC)!=InpMagic) continue;
+      if(OrderGetString(ORDER_SYMBOL)!=sym)      continue;
+
+      int type=(int)OrderGetInteger(ORDER_TYPE);
+      if(type!=ORDER_TYPE_BUY_LIMIT && type!=ORDER_TYPE_SELL_LIMIT &&
+         type!=ORDER_TYPE_BUY_STOP  && type!=ORDER_TYPE_SELL_STOP)
+         continue; // 成行は対象外
+
+      string c = OrderGetString(ORDER_COMMENT);
+      if(StringFind(c, prefix, 0) == 0) cnt++;
+   }
+   return cnt;
+}
+
+// コメントに指定文字列を含む保留注文の件数を返すヘルパー。
+// セルフレビュー用に「TRD系」「RNG系」の残数を簡易的に把握するために使用する。
+int CountPendingBySubstring(const string needle)
+{
+   int total=OrdersTotal();
+   int cnt=0;
+   for(int i=0; i<total; ++i)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket==0)               continue; // 無効チケットはスキップ
+      if(!OrderSelect(ticket))    continue; // 選択できない場合は次へ
+      if(OrderGetInteger(ORDER_MAGIC)!=InpMagic) continue; // 本EA以外は対象外
+      if(OrderGetString(ORDER_SYMBOL)!=sym)      continue; // シンボル違いも除外
+
+      int type=(int)OrderGetInteger(ORDER_TYPE);
+      if(type!=ORDER_TYPE_BUY_LIMIT && type!=ORDER_TYPE_SELL_LIMIT &&
+         type!=ORDER_TYPE_BUY_STOP  && type!=ORDER_TYPE_SELL_STOP)
+         continue; // 成行は数えない
+
+      string c = OrderGetString(ORDER_COMMENT);
+      if(StringFind(c, needle, 0) >= 0) cnt++; // 部分一致でカウント
+   }
+   return cnt;
+}
+
+//=====================================================================
+// セルフレビュー：モード/レジーム/抑止状態と保留注文状況をH1ごとに出力し、
+// 「どの条件で撃っていないのか」を後から追跡しやすくする。
+// backtestでもログで確認できるよう、H1確定ごとに1回のみ出力する。
+//=====================================================================
+void SelfReviewStatus(Regime regime, bool trdEnabled, bool rngEnabled, bool bothEnabled)
+{
+   static datetime lastPrintedH1=0; // 同一H1バーでの重複出力防止
+   datetime curH1=iTime(sym, TF_H1, 0);
+   if(curH1==lastPrintedH1) return;
+   lastPrintedH1 = curH1;
+
+   // モード文字列（InpModuleSwitch）を人間が見やすい形に整形
+   string modeStr;
+   switch(InpModuleSwitch)
+   {
+      case MODE_BOTH:     modeStr = "BOTH"; break;
+      case MODE_TRD_ONLY: modeStr = "TRD_ONLY"; break;
+      case MODE_RNG_ONLY: modeStr = "RNG_ONLY"; break;
+      case MODE_ALL_OFF:  modeStr = "ALL_OFF"; break;
+      default:            modeStr = "UNKNOWN"; break;
+   }
+
+   // 現在の状態を収集
+   string regStr      = (regime==REG_TRD?"TRD":"RNG");
+   string lastRegStr  = (lastRegime==REG_TRD?"TRD":"RNG");
+   bool   hasPos      = AnyOpenPosition();
+   int    pendTRD     = CountPendingBySubstring("TRD_");
+   int    pendRngBuy  = CountPendingBySubstring("RNG_BUYLIMIT");
+   int    pendRngSell = CountPendingBySubstring("RNG_SELLLIMIT");
+
+   // 抑止状態や強制レジームの有無をまとめてログ出力
+   PrintFormat("セルフレビュー[H1] mode=%s TRD有効=%s RNG有効=%s gate使用=%s regime=%s lastRegime=%s inhibit=%s ポジ有=%s TRD保留=%d RNG保留(B/S)=%d/%d",
+               modeStr,
+               trdEnabled?"true":"false",
+               rngEnabled?"true":"false",
+               bothEnabled?"true":"false",
+               regStr,
+               lastRegStr,
+               inhibitEntryThisH1Bar?"true":"false",
+               hasPos?"true":"false",
+               pendTRD,
+               pendRngBuy,
+               pendRngSell);
 }
