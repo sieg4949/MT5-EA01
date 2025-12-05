@@ -157,6 +157,10 @@ datetime lastAnchorTimeSell  = 0;
 datetime lastM5BarTime = 0;
 datetime lastM1BarTime = 0;
 
+// RNGデバッグのパラメータ再掲用。初期化時に日付を記録し、日付が変わった最初のティックで再出力する。
+// 日付判定は「YYYYMMDD」を整数化したキーで行い、月をまたぐ際にも正しく切り替わるようにする。
+int      lastRngParamLogDateKey = -1;
+
 // レジーム
 enum Regime { REG_RNG = 0, REG_TRD = 1 };
 Regime lastRegime = REG_RNG;        // ← ヒステリシス参照もこの値に統一
@@ -171,6 +175,8 @@ bool   CacheSeries();
 Regime CalcRegimeH1();                       // H1ゲート（β×σ、ヒステリシス）
 double EdgeScore(int sh);                    // M5 Edge（0..1）
 bool   GetHHLL(int sh, double &hh, double &ll);
+
+int    MakeDateKey(datetime ts);             // 日付を YYYYMMDD の整数キーに変換
 
 bool   FindLastPivotLowBelow(double entryPrice, double &pivotLow);
 bool   FindLastPivotHighAbove(double entryPrice, double &pivotHigh);
@@ -198,6 +204,18 @@ bool   ComputeZ_VR_OU(int sh, double &z, double &vr, double &ou_time);
 int    CurrentHourJST();                     // ブローカー時刻→UTC→JST(+9)
 bool   IsTRDEnabled();                       // 運用モードから求めるTRD可否
 bool   IsRNGEnabled();                       // 運用モードから求めるRNG可否
+
+// 時刻から「YYYYMMDD」形式の整数キーを生成するユーティリティ。
+// 月またぎ・年またぎでも一意な日付キーとなるため、日次の状態管理に使う。
+int MakeDateKey(datetime ts)
+{
+   MqlDateTime mt;
+   TimeToStruct(ts, mt); // サーバー時刻を構造体に展開
+
+   // 例: 2025年12月05日 → 20251205
+   int dateKey = (mt.year * 10000) + (mt.mon * 100) + mt.day;
+   return dateKey;
+}
 
 //============================= 有効判定 ==============================
 // モード切替のみで最終的にTRD/RNGを稼働させるかを返す。
@@ -259,6 +277,28 @@ int OnInit()
    lastM5BarTime = iTime(sym, TF_M5, 0);
    lastM1BarTime = iTime(sym, TF_M1, 0);
 
+   // デバッグログ有効時は、RNG判定に使う主要なしきい値を起動直後に1行で可視化する。
+   // これにより、パラメータセットの読み間違いや旧バイナリの使用で意図と異なる値が入っていないか
+   // 即座に検証できる（今回のBBWThr=0.800出力のようなギャップを早期に把握する目的）。
+   if(InpRngDebugLog)
+   {
+      PrintFormat("RNGDBG params_init VR_Thr=%.3f OU=[%d..%d] RngUseBBW=%s BBW2ATR=%.3f",
+                  InpVR_Thr,
+                  InpOU_Min,
+                  InpOU_Max,
+                  InpRngUseBBW?"true":"false",
+                  InpBBW2ATR);
+
+      // 初期化時点の日付を保持し、以後は日付が変わったタイミングのみ再掲する。
+      // 1分足テスターではティックごとに TimeTradeServer()/TimeCurrent() が現在時刻へ更新される
+      // ケースがあるため、日付の取得元は「最新のM1バーの時刻」を最優先する。
+      // バッファ未取得で iTime が 0 を返す初回のみサーバー時刻をフォールバックに使う。
+      datetime firstM1Time = iTime(sym, TF_M1, 0);
+      datetime now         = (firstM1Time > 0) ? firstM1Time : GetServerTime();
+      int      dateKey     = MakeDateKey(now); // 日付キー化で月跨ぎでも再掲タイミングを正確に制御
+      lastRngParamLogDateKey = dateKey;        // 以後の再掲判定はこの日付キーを基準に行う
+   }
+
    Print("初期化完了（TRD＋RNG統合 v1.2）");
    return INIT_SUCCEEDED;
 }
@@ -273,6 +313,34 @@ void OnTick()
 {
    // 参照配列の更新（取得失敗なら抜け）
    if(!CacheSeries()) return;
+
+   // ログが流れて初期化時の設定行が埋もれるのを防ぐため、RNGデバッグONなら日付変化後の最初のティックで
+   // しきい値を再掲する。これにより、深夜帯にログを開いても当日の設定をスクロール無しで即確認できる。
+   if(InpRngDebugLog)
+   {
+      // 1分足テスターで「現在時刻」がリアルタイムに進む環境では、TimeTradeServer()/TimeCurrent() ベース
+      // の日付判定だと毎分異なる日付キーを生成してしまい、1分おきに再掲される現象が起こる。
+      // これを防ぐため、必ず「直近M1バーの時刻」から日付を抽出し、バー日付が切り替わったときのみ再掲する。
+      // iTime がゼロを返すレアケースでは、フォールバックとしてサーバー時刻を使用し、ゼロ日付で誤検出しない。
+      datetime latestM1Time = iTime(sym, TF_M1, 0);
+      datetime now          = (latestM1Time > 0) ? latestM1Time : GetServerTime();
+      int      todayKey     = MakeDateKey(now); // バーの日付を整数キー化
+      bool     dayChanged   = (lastRngParamLogDateKey != todayKey);
+
+      if(dayChanged)
+      { 
+         PrintFormat("RNGDBG params_recap VR_Thr=%.3f OU=[%d..%d] RngUseBBW=%s BBW2ATR=%.3f",
+                     InpVR_Thr,
+                     InpOU_Min,
+                     InpOU_Max,
+                     InpRngUseBBW?"true":"false",
+                     InpBBW2ATR);
+
+         // 日付が変わったので記録を更新し、同日に複数回出力しないよう抑制する。
+         // latestM1Time が 0 だった場合でも日付キーで確定し、次回以降は安定して抑止が効く。
+         lastRngParamLogDateKey = todayKey;
+      }
+   }
 
    // モードと個別入力を合成した有効/無効判定を先に取得しておく
    bool trdEnabled = IsTRDEnabled();
@@ -926,11 +994,14 @@ void TryPlaceMeanRevertLimits(Regime cur)
       double atr = ATR_M1[sh];
       if(atr<=0.0) return;
       double bbw = 4.0*STD_M1[sh]; // Bollinger ±2σ幅（上-下）。σが欠損するケースも考慮して簡潔に計算。
-      if(bbw/atr > InpBBW2ATR)
+      if((bbw/atr/10) > InpBBW2ATR)
       {
          // BB幅超過時もOUレンジを残し、時間帯・VR・OUのどこで落ちたかを同一フォーマットで追跡する
          // BB幅超過時は、許容比と実測比のどちらが適切か後で判断できるようにしきい値も併記する
          LogRngSkip("BBW_over", z, vr, ou, cur, hourJST, ouMin, ouMax, true, InpVR_Thr, InpRngUseBBW?InpBBW2ATR:-1.0);
+         PrintFormat("BBW_over bbw=%.3f atr=%.3f",
+                     bbw,
+                     atr);
          return;
       }
    }
