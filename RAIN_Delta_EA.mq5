@@ -205,7 +205,9 @@ void CRegimeEngine::Init()
    // - ATR でボラティリティを正規化して MA 差との比率を計算する
    m_handle_ma_fast_h1 = iMA(_Symbol, PERIOD_H1, InpH1_MA_Fast, 0, MODE_EMA, PRICE_CLOSE);
    m_handle_ma_slow_h1 = iMA(_Symbol, PERIOD_H1, InpH1_MA_Slow, 0, MODE_EMA, PRICE_CLOSE);
-   m_handle_adx_h1     = iADX(_Symbol, PERIOD_H1, InpH1_ADX_Period, PRICE_CLOSE);
+   //--- iADX はシンボル・時間足・期間の 3 つを指定すれば十分なため、余計な価格種別パラメータを削除
+   //     これによりコンパイル時の引数数エラーを解消し、ADX 判定に必要なハンドルだけを正しく生成する
+   m_handle_adx_h1     = iADX(_Symbol, PERIOD_H1, InpH1_ADX_Period);
    m_handle_atr_h1     = iATR(_Symbol, PERIOD_H1, 14);
 
    if(m_handle_ma_fast_h1==INVALID_HANDLE ||
@@ -516,12 +518,32 @@ bool CGlobalGate::CanOpen()
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(balance > 0.0)
      {
-      double daily_dd_pct  = 100.0 * MathAbs(m_state_tracker->DailyDD())  / balance;
-      double weekly_dd_pct = 100.0 * MathAbs(m_state_tracker->WeeklyDD()) / balance;
+      //--- ドローダウン値を安全に読み出す
+      //     変数配置をシンプルにし、NULL チェックの後に順番に値を取得する。
+      double daily_dd_value  = 0.0;
+      double weekly_dd_value = 0.0;
 
+      // ポインタが無効なら即座に終了し、ログで異常を通知
+      CStateTracker *state_ptr = m_state_tracker;
+      if(state_ptr == NULL)
+        {
+         LogPrint("ERROR", "GATE", "CanOpen: StateTracker が NULL です (DD 取得失敗)。");
+         return(false);
+        }
+
+      //--- ポインタ経由で値を順に取得（MQL はポインタでもドット演算子を使う点に注意）
+      //     C/C++ 風に "->" を用いると "'>' - operand expected" となるため、
+      //     安全にドット演算子でメソッドを呼び出す。
+      daily_dd_value  = state_ptr.DailyDD();
+      weekly_dd_value = state_ptr.WeeklyDD();
+
+      //--- 口座残高に対するパーセンテージへ変換
+      double daily_dd_pct  = 100.0 * MathAbs(daily_dd_value)  / balance;
+      double weekly_dd_pct = 100.0 * MathAbs(weekly_dd_value) / balance;
+
+      //--- 最大許容 DD を超えた場合は、その日 / 週の新規エントリを停止
       if(daily_dd_pct >= InpMaxDailyDD || weekly_dd_pct >= InpMaxWeeklyDD)
         {
-         // 最大許容 DD を超えた場合は、その日 / 週は新規エントリを停止
          LogPrint("WARN", "GATE",
                   StringFormat("CanOpen: DD 超過によりエントリ禁止 (DailyDD=%.2f%%, WeeklyDD=%.2f%%)",
                                daily_dd_pct, weekly_dd_pct));
@@ -588,7 +610,25 @@ bool CGlobalGate::CanOpen()
    //================================================================
    // 5) レジーム変更直後のクールダウン
    //================================================================
-   if(m_regime_engine->InCooldown())
+   //--- レジームエンジンのポインタを再確認した上でクールダウン状態を取得する。
+   //     三項演算子や論理積でまとめると、稀にコンパイル時に解釈が
+   //     不安定になるケースがあるため、明示的な if 構造で安全に値を取得する。
+   bool           in_cooldown = false;
+   CRegimeEngine *reg_ptr     = m_regime_engine; // ローカルに保持してから参照
+
+   //--- ポインタが無効ならすぐに終了し、安全側に倒す
+   if(reg_ptr == NULL)
+     {
+      LogPrint("ERROR", "GATE", "CanOpen: RegimeEngine が NULL です (クールダウン判定不可)。");
+      return(false);
+     }
+
+   // 参照型束縛はローカルでは使えないため、NULL チェック後にドット演算子で
+   // 状態を取得する。ポインタであっても "->" ではなくドットを使う点を明記。
+   // これにより前回報告された演算子誤解釈エラーを解消する。
+   in_cooldown = reg_ptr.InCooldown();
+
+   if(in_cooldown)
      {
       // クールダウン中は新規ポジションを控える
       return(false);
