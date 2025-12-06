@@ -469,14 +469,33 @@ void CGlobalGate::Attach(CRegimeEngine *reg, CStateTracker *state)
    m_state_tracker = state;
   }
 
+//------------------------------------------------------------------
+// CGlobalGate::CanOpen
+//  - 新規エントリをしてよい状況かどうかを判定する
+//  - 時間帯 / DD / スプレッド / ATR 比 / レジームクールダウン / ニュース などをまとめてチェック
+//------------------------------------------------------------------
 bool CGlobalGate::CanOpen()
   {
    //================================================================
+   // 0) Spread/ATR ログ間引き用の static 変数
+   //    - last_spread_atr_block:
+   //        直近の判定で「Spread/ATR が NG だった状態かどうか」
+   //    - last_spread_atr_log_time:
+   //        最後に NG ログを出した時刻
+   //    - これにより、Spread/ATR NG が連続している間は
+   //      「状態が変わった瞬間 ＋ 一定秒数ごと」にしかログを出さない
+   //================================================================
+   static bool     last_spread_atr_block    = false;
+   static datetime last_spread_atr_log_time = 0;
+   const  int      SPREAD_ATR_LOG_INTERVAL_SEC = 60;   // Spread/ATR NG ログを出す最小間隔（秒）
+
+   //================================================================
    // 1) モジュールのアタッチ状態チェック
+   //    - RegimeEngine / StateTracker が正しくセットされていない場合は
+   //      システム異常とみなし、安全側（新規エントリ禁止）に倒す
    //================================================================
    if(m_regime_engine == NULL || m_state_tracker == NULL)
      {
-      // 何かがおかしい状態なので、安全側に倒してエントリを禁止する
       LogPrint("ERROR", "GATE", "CanOpen: RegimeEngine または StateTracker が未アタッチです。");
       return(false);
      }
@@ -484,7 +503,7 @@ bool CGlobalGate::CanOpen()
    //================================================================
    // 2) 取引時間帯フィルタ
    //    - InpTradeStartHour ～ InpTradeEndHour の間だけ新規エントリを許可
-   //    - 終了時刻が開始時刻より小さい場合は「日またぎ」とみなす（例: 16～3 時）
+   //    - 終了時刻 < 開始時刻 の場合は「日またぎ」（例: 16～3 時）として扱う
    //================================================================
    MqlDateTime mt;
    TimeToStruct(TimeCurrent(), mt);
@@ -493,7 +512,7 @@ bool CGlobalGate::CanOpen()
    bool time_ok = false;
    if(InpTradeStartHour == InpTradeEndHour)
      {
-      // 同じ値の場合は「24 時間許可」として扱う
+      // 同じ値の場合は「24時間許可」として扱う
       time_ok = true;
      }
    else if(InpTradeStartHour < InpTradeEndHour)
@@ -512,38 +531,18 @@ bool CGlobalGate::CanOpen()
 
    //================================================================
    // 3) 日次 / 週次ドローダウンチェック
-   //    CStateTracker は JPY 建て損益を保持しているため、口座残高に対する %
-   //    へ変換してから閾値と比較する。
+   //    - CStateTracker が保持している日次 / 週次 DD（JPY建て）を
+   //      現在残高に対するパーセンテージに変換し、閾値と比較する
    //================================================================
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(balance > 0.0)
      {
-      //--- ドローダウン値を安全に読み出す
-      //     変数配置をシンプルにし、NULL チェックの後に順番に値を取得する。
-      double daily_dd_value  = 0.0;
-      double weekly_dd_value = 0.0;
+      double daily_dd_pct  = 100.0 * MathAbs(m_state_tracker->DailyDD())  / balance;
+      double weekly_dd_pct = 100.0 * MathAbs(m_state_tracker->WeeklyDD()) / balance;
 
-      // ポインタが無効なら即座に終了し、ログで異常を通知
-      CStateTracker *state_ptr = m_state_tracker;
-      if(state_ptr == NULL)
-        {
-         LogPrint("ERROR", "GATE", "CanOpen: StateTracker が NULL です (DD 取得失敗)。");
-         return(false);
-        }
-
-      //--- ポインタ経由で値を順に取得（MQL はポインタでもドット演算子を使う点に注意）
-      //     C/C++ 風に "->" を用いると "'>' - operand expected" となるため、
-      //     安全にドット演算子でメソッドを呼び出す。
-      daily_dd_value  = state_ptr.DailyDD();
-      weekly_dd_value = state_ptr.WeeklyDD();
-
-      //--- 口座残高に対するパーセンテージへ変換
-      double daily_dd_pct  = 100.0 * MathAbs(daily_dd_value)  / balance;
-      double weekly_dd_pct = 100.0 * MathAbs(weekly_dd_value) / balance;
-
-      //--- 最大許容 DD を超えた場合は、その日 / 週の新規エントリを停止
       if(daily_dd_pct >= InpMaxDailyDD || weekly_dd_pct >= InpMaxWeeklyDD)
         {
+         // 最大許容 DD を超えた場合は、新規エントリを停止
          LogPrint("WARN", "GATE",
                   StringFormat("CanOpen: DD 超過によりエントリ禁止 (DailyDD=%.2f%%, WeeklyDD=%.2f%%)",
                                daily_dd_pct, weekly_dd_pct));
@@ -553,28 +552,31 @@ bool CGlobalGate::CanOpen()
 
    //================================================================
    // 4) スプレッド / ATR_M1 チェック
-   //    - 絶対スプレッド(pips) が InpMaxSpreadPips を超える場合はエントリ禁止
-   //    - ATR_M1 が取得できる場合は Spread(pips) / ATR_M1(pips) の比率もチェック
+   //    4-1) 絶対スプレッド (pips) の上限チェック
+   //    4-2) Spread(pips) / ATR_M1(pips) の比率チェック（ログ間引き付き）
    //================================================================
    long spread_points = 0;
    if(!SymbolInfoInteger(_Symbol, SYMBOL_SPREAD, spread_points))
      {
-      // スプレッド情報が取得できないのは異常なのでエントリ禁止
+      // スプレッド情報が取得できないのは異常なので、安全のためエントリ禁止
       LogPrint("ERROR", "GATE", "CanOpen: SYMBOL_SPREAD が取得できません。");
       return(false);
      }
 
    double point    = _Point;
-   double pip_size = (_Digits == 3 || _Digits == 5) ? 10.0 * point : point; // USDJPY 等: 0.01 が 1 pip
+   // USDJPY など 3桁 / 5桁の場合は「Point × 10」が 1pip
+   // それ以外は「Point」が 1pip とみなす
+   double pip_size = (_Digits == 3 || _Digits == 5) ? (10.0 * point) : point;
    double spread_pips = (double)spread_points * point / pip_size;
 
    if(spread_pips <= 0.0)
      {
+      // スプレッドが 0 以下は通常あり得ないので、一旦エントリを控える
       LogPrint("WARN", "GATE", "CanOpen: スプレッドが 0 以下のためエントリをスキップします。");
       return(false);
      }
 
-   // 絶対スプレッドの上限チェック
+   //--- 絶対スプレッドの上限チェック
    if(spread_pips > InpMaxSpreadPips)
      {
       LogPrint("INFO", "GATE",
@@ -583,25 +585,55 @@ bool CGlobalGate::CanOpen()
       return(false);
      }
 
-   // ATR_M1 を使った相対スプレッド比チェック
+   //--- ATR_M1 を使った相対スプレッド比チェック
    if(InpMaxSpreadATRRatio > 0.0 && g_handle_atr_m1 != INVALID_HANDLE)
      {
       double atr_buf[1];
       if(CopyBuffer(g_handle_atr_m1, 0, 1, 1, atr_buf) == 1)
         {
-         double atr_m1      = atr_buf[0];                           // 価格単位
+         double atr_m1      = atr_buf[0];                    // 価格単位 (例: 0.0115)
          double atr_m1_pips = (atr_m1 > 0.0 ? atr_m1 / pip_size : 0.0); // pips に換算
 
          if(atr_m1_pips > 0.0)
            {
-            double ratio = spread_pips / atr_m1_pips;
+            double ratio = spread_pips / atr_m1_pips;        // Spread(pips) / ATR_M1(pips)
 
             if(ratio > InpMaxSpreadATRRatio)
               {
-               LogPrint("INFO", "GATE",
-                        StringFormat("CanOpen: Spread/ATR 比が上限を超過 (Spread=%.2f pips, ATR_M1=%.2f pips, Ratio=%.2f, Max=%.2f)",
-                                     spread_pips, atr_m1_pips, ratio, InpMaxSpreadATRRatio));
+               // 今回の判定では Spread/ATR が NG
+               bool should_log = false;
+
+               // 1) 状態が「OK → NG」に変化した最初のタイミングでは必ずログを出す
+               if(!last_spread_atr_block)
+                  should_log = true;
+               // 2) すでに NG 状態が継続している場合は、一定秒数ごとにだけログを出す
+               else if(TimeCurrent() - last_spread_atr_log_time >= SPREAD_ATR_LOG_INTERVAL_SEC)
+                  should_log = true;
+
+               if(should_log)
+                 {
+                  LogPrint("INFO", "GATE",
+                           StringFormat("CanOpen: Spread/ATR 比が上限を超過 (Spread=%.2f pips, ATR_M1=%.2f pips, Ratio=%.2f, Max=%.2f)",
+                                        spread_pips, atr_m1_pips, ratio, InpMaxSpreadATRRatio));
+                  last_spread_atr_log_time = TimeCurrent();
+                 }
+
+               // NG 状態フラグをセットし、このティックでは新規エントリ禁止
+               last_spread_atr_block = true;
                return(false);
+              }
+            else
+              {
+               // 今回の判定では Spread/ATR は OK
+               // 直前まで NG 状態だった場合、閾値内に復帰したことを 1 回だけログ出力する
+               if(last_spread_atr_block)
+                 {
+                  LogPrint("INFO", "GATE",
+                           StringFormat("CanOpen: Spread/ATR 比が閾値内に復帰 (Spread=%.2f pips, ATR_M1=%.2f pips, Ratio=%.2f, Max=%.2f)",
+                                        spread_pips, atr_m1_pips, ratio, InpMaxSpreadATRRatio));
+                 }
+               // 状態フラグを OK 側に戻す
+               last_spread_atr_block = false;
               }
            }
         }
@@ -609,44 +641,28 @@ bool CGlobalGate::CanOpen()
 
    //================================================================
    // 5) レジーム変更直後のクールダウン
+   //    - レジームが変化してから InpRegimeCooldownBars_H1 本の間は
+   //      相場が落ち着くまで新規エントリを控える
    //================================================================
-   //--- レジームエンジンのポインタを再確認した上でクールダウン状態を取得する。
-   //     三項演算子や論理積でまとめると、稀にコンパイル時に解釈が
-   //     不安定になるケースがあるため、明示的な if 構造で安全に値を取得する。
-   bool           in_cooldown = false;
-   CRegimeEngine *reg_ptr     = m_regime_engine; // ローカルに保持してから参照
-
-   //--- ポインタが無効ならすぐに終了し、安全側に倒す
-   if(reg_ptr == NULL)
+   if(m_regime_engine->InCooldown())
      {
-      LogPrint("ERROR", "GATE", "CanOpen: RegimeEngine が NULL です (クールダウン判定不可)。");
-      return(false);
-     }
-
-   // 参照型束縛はローカルでは使えないため、NULL チェック後にドット演算子で
-   // 状態を取得する。ポインタであっても "->" ではなくドットを使う点を明記。
-   // これにより前回報告された演算子誤解釈エラーを解消する。
-   in_cooldown = reg_ptr.InCooldown();
-
-   if(in_cooldown)
-     {
-      // クールダウン中は新規ポジションを控える
       return(false);
      }
 
    //================================================================
    // 6) ニュースフィルタ
-   //    Phase1 ではまだ具体的なニュース連携は行わないため、フラグが ON の場合でも
-   //    ログを出すだけに留める。将来的に外部 CSV / Web 連携を実装する想定。
+   //    - Phase1 ではまだニュース連携を実装しない
+   //    - フラグが ON でも挙動は変えず、将来の拡張ポイントとして残す
    //================================================================
    if(InpUseNewsFilter)
      {
       // TODO: ニュース時間帯の取得ロジックを実装する
-      // 現時点では挙動を変えたくないため、判定には使わずログのみ。
-      //LogPrint("INFO", "GATE", "CanOpen: ニュースフィルタは未実装（ログのみ）。");
+      // 現時点では挙動を変えない（ログも控えめにするため何も出さない）
      }
 
-   // ここまで全ての条件をパスした場合にのみ新規エントリを許可
+   //================================================================
+   // 7) ここまで全ての条件をパスした場合のみ、新規エントリ許可
+   //================================================================
    return(true);
   }
 
@@ -916,6 +932,19 @@ void OnTick()
    //--- H1新バー → レジーム更新
    if(new_h1)
       g_regime.OnNewBarH1();
+
+   // H1 新バー時だけデバッグログを出す（テスト用）
+   if(new_h1)
+     {
+      datetime d = DateOfDay(TimeCurrent());
+      datetime w = WeekStartMonday(TimeCurrent());
+   
+      LogPrint("INFO", "TEST",
+               StringFormat("Now=%s, DateOfDay=%s, WeekStart=%s",
+                            TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS),
+                            TimeToString(d, TIME_DATE|TIME_SECONDS),
+                            TimeToString(w, TIME_DATE|TIME_SECONDS)));
+     }
 
    //--- M5新バー → AlphaA / AlphaB の状態更新
    if(new_m5)
