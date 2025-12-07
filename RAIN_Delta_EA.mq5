@@ -122,6 +122,37 @@ void LogPrint(string level, string tag, string msg)
    PrintFormat("[%s][%s][%s] %s", t, level, tag, msg);
   }
 
+//+------------------------------------------------------------------+
+//| CanOpen 用のログ間引きヘルパ                                    |
+//| - Spread/ATR 以外の判定ログは頻出しやすいため、同じ理由が短時間 |
+//|   に連続発生しても一定秒数に 1 回だけ出力するように制御する。  |
+//| - 引数 reason でログ理由のカテゴリ文字列を渡し、前回理由が変わ |
+//|   った場合は即座に出力し、同一理由が続く場合のみ間隔制御する。 |
+//+------------------------------------------------------------------+
+bool ShouldLogCanOpenNonATR(const string reason,
+                            datetime &last_time,
+                            string   &last_reason,
+                            const int interval_sec)
+  {
+   // まだ一度も出力していない、または理由が変わった場合は即出力
+   if(last_reason != reason)
+     {
+      last_reason = reason;
+      last_time   = TimeCurrent();
+      return(true);
+     }
+
+   // 同一理由が続いている場合は、指定秒数以上経過したら出力を許可
+   if(TimeCurrent() - last_time >= interval_sec)
+     {
+      last_time = TimeCurrent();
+      return(true);
+     }
+
+   // それ以外は間引く
+   return(false);
+  }
+
 //==================================================================
 // 日付計算ユーティリティ
 //==================================================================
@@ -447,27 +478,33 @@ void CStateTracker::AddTradeResult(double pl)
 //==================================================================
 class CGlobalGate
   {
-private:
-   CRegimeEngine *m_regime_engine;
-   CStateTracker *m_state_tracker;
+ private:
+    CRegimeEngine *m_regime_engine;
+    CStateTracker *m_state_tracker;
 
-public:
-                     CGlobalGate();
-   void              Attach(CRegimeEngine *reg, CStateTracker *state);
-   bool              CanOpen(); // 新規エントリ可能か？
+ public:
+                      CGlobalGate();
+    //--- 外部で生成されたレジームエンジンと状態管理インスタンスを紐付ける
+    //     ポインタを直接受け取るよりも、参照経由で受けてから安全にアドレスを保持する方が
+    //     誤った引数（null など）をコンパイル時に早期検出できるため、引数は参照で受ける
+    void              Attach(CRegimeEngine &reg, CStateTracker &state);
+    bool              CanOpen(); // 新規エントリ可能か？
   };
 
 CGlobalGate::CGlobalGate()
-  {
-   m_regime_engine = NULL;
-   m_state_tracker = NULL;
-  }
+   {
+    //--- 初期状態では未接続として明示的に NULL を設定しておく
+    m_regime_engine = NULL;
+    m_state_tracker = NULL;
+   }
 
-void CGlobalGate::Attach(CRegimeEngine *reg, CStateTracker *state)
-  {
-   m_regime_engine = reg;
-   m_state_tracker = state;
-  }
+void CGlobalGate::Attach(CRegimeEngine &reg, CStateTracker &state)
+   {
+    //--- 参照で受け取った外部オブジェクトのアドレスを保持する
+    //     ここでは単にアドレスを保存するだけで、null チェックは CanOpen 内で行う
+    m_regime_engine = &reg;
+    m_state_tracker = &state;
+   }
 
 //------------------------------------------------------------------
 // CGlobalGate::CanOpen
@@ -490,13 +527,27 @@ bool CGlobalGate::CanOpen()
    const  int      SPREAD_ATR_LOG_INTERVAL_SEC = 60;   // Spread/ATR NG ログを出す最小間隔（秒）
 
    //================================================================
+   // 0-2) Spread/ATR 以外のログ間引き用 static 変数
+   //    - 理由が同じログが短時間に連続しないように、最後のログ理由と
+   //      出力時刻を記録し、一定秒数を下回る場合は出力を抑制する
+   //================================================================
+   static datetime last_gate_log_time    = 0;
+   static string   last_gate_log_reason  = "";
+   const  int      GATE_LOG_INTERVAL_SEC = 60;   // CanOpen 内の一般ログを出す最小間隔（秒）
+
+   //================================================================
    // 1) モジュールのアタッチ状態チェック
    //    - RegimeEngine / StateTracker が正しくセットされていない場合は
    //      システム異常とみなし、安全側（新規エントリ禁止）に倒す
    //================================================================
    if(m_regime_engine == NULL || m_state_tracker == NULL)
      {
-      LogPrint("ERROR", "GATE", "CanOpen: RegimeEngine または StateTracker が未アタッチです。");
+      // ログ理由を明示しつつ、直近出力から一定秒数未満なら間引く
+      string reason = "Regime/State 未アタッチ";
+      if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
+        {
+         LogPrint("ERROR", "GATE", "CanOpen: RegimeEngine または StateTracker が未アタッチです。");
+        }
       return(false);
      }
 
@@ -537,15 +588,22 @@ bool CGlobalGate::CanOpen()
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(balance > 0.0)
      {
-      double daily_dd_pct  = 100.0 * MathAbs(m_state_tracker->DailyDD())  / balance;
-      double weekly_dd_pct = 100.0 * MathAbs(m_state_tracker->WeeklyDD()) / balance;
+      // MQL5 ではクラスポインタであってもメンバアクセスは「.」で行うため
+      // 「->」を使用するとコンパイル時に演算子エラーとなる。必ず「.」を使って
+      // メソッドを呼び出すことで、MathAbs への引数が適切な double 型となる。
+      double daily_dd_pct  = 100.0 * MathAbs(m_state_tracker.DailyDD())  / balance;
+      double weekly_dd_pct = 100.0 * MathAbs(m_state_tracker.WeeklyDD()) / balance;
 
       if(daily_dd_pct >= InpMaxDailyDD || weekly_dd_pct >= InpMaxWeeklyDD)
         {
          // 最大許容 DD を超えた場合は、新規エントリを停止
-         LogPrint("WARN", "GATE",
-                  StringFormat("CanOpen: DD 超過によりエントリ禁止 (DailyDD=%.2f%%, WeeklyDD=%.2f%%)",
-                               daily_dd_pct, weekly_dd_pct));
+         string reason = "DD 超過";
+         if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
+           {
+            LogPrint("WARN", "GATE",
+                     StringFormat("CanOpen: DD 超過によりエントリ禁止 (DailyDD=%.2f%%, WeeklyDD=%.2f%%)",
+                                  daily_dd_pct, weekly_dd_pct));
+           }
          return(false);
         }
      }
@@ -559,7 +617,11 @@ bool CGlobalGate::CanOpen()
    if(!SymbolInfoInteger(_Symbol, SYMBOL_SPREAD, spread_points))
      {
       // スプレッド情報が取得できないのは異常なので、安全のためエントリ禁止
-      LogPrint("ERROR", "GATE", "CanOpen: SYMBOL_SPREAD が取得できません。");
+      string reason = "SYMBOL_SPREAD取得失敗";
+      if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
+        {
+         LogPrint("ERROR", "GATE", "CanOpen: SYMBOL_SPREAD が取得できません。");
+        }
       return(false);
      }
 
@@ -572,16 +634,24 @@ bool CGlobalGate::CanOpen()
    if(spread_pips <= 0.0)
      {
       // スプレッドが 0 以下は通常あり得ないので、一旦エントリを控える
-      LogPrint("WARN", "GATE", "CanOpen: スプレッドが 0 以下のためエントリをスキップします。");
+      string reason = "スプレッド異常(<=0)";
+      if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
+        {
+         LogPrint("WARN", "GATE", "CanOpen: スプレッドが 0 以下のためエントリをスキップします。");
+        }
       return(false);
      }
 
    //--- 絶対スプレッドの上限チェック
    if(spread_pips > InpMaxSpreadPips)
      {
-      LogPrint("INFO", "GATE",
-               StringFormat("CanOpen: スプレッドが上限を超過 (Spread=%.2f pips, Max=%.2f pips)",
-                            spread_pips, InpMaxSpreadPips));
+      string reason = "スプレッド上限超過";
+      if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
+        {
+         LogPrint("INFO", "GATE",
+                  StringFormat("CanOpen: スプレッドが上限を超過 (Spread=%.2f pips, Max=%.2f pips)",
+                               spread_pips, InpMaxSpreadPips));
+        }
       return(false);
      }
 
@@ -644,7 +714,8 @@ bool CGlobalGate::CanOpen()
    //    - レジームが変化してから InpRegimeCooldownBars_H1 本の間は
    //      相場が落ち着くまで新規エントリを控える
    //================================================================
-   if(m_regime_engine->InCooldown())
+   // ポインタ経由アクセス時も「.」を用い、クールダウン中であれば安全側でエントリ禁止
+   if(m_regime_engine.InCooldown())
      {
       return(false);
      }
@@ -894,9 +965,10 @@ int OnInit()
      }
 
    //--- 各モジュール初期化
-   g_regime.Init();
-   g_state.Init();
-   g_gate.Attach(&g_regime, &g_state);
+    g_regime.Init();
+    g_state.Init();
+    //--- 参照経由で安全にアタッチ（& を呼び出し側で付けないことで、誤用を防止）
+    g_gate.Attach(g_regime, g_state);
 
    g_alpha_a.Init();
    g_alpha_b.Init();
