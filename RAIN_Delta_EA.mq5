@@ -231,14 +231,12 @@ CRegimeEngine::CRegimeEngine()
 void CRegimeEngine::Init()
   {
    // H1 のトレンド・レジーム判定に使用するインジケータハンドルを生成する
-   // - EMA(終値) 2 本でトレンド方向と傾きの強さを確認
+   // - EMA(終値) 2 本でトレンド方向と強さを確認
    // - ADX でトレンドの強さを確認
-   // - ATR でボラティリティを正規化して MA 差との比率を計算する
+   // - ATR でボラティリティを取得し、MA差との比率を計算する
    m_handle_ma_fast_h1 = iMA(_Symbol, PERIOD_H1, InpH1_MA_Fast, 0, MODE_EMA, PRICE_CLOSE);
    m_handle_ma_slow_h1 = iMA(_Symbol, PERIOD_H1, InpH1_MA_Slow, 0, MODE_EMA, PRICE_CLOSE);
-   //--- iADX はシンボル・時間足・期間の 3 つを指定すれば十分なため、余計な価格種別パラメータを削除
-   //     これによりコンパイル時の引数数エラーを解消し、ADX 判定に必要なハンドルだけを正しく生成する
-   m_handle_adx_h1     = iADX(_Symbol, PERIOD_H1, InpH1_ADX_Period);
+   m_handle_adx_h1     = iADX(_Symbol, PERIOD_H1, InpH1_ADX_Period, PRICE_CLOSE);
    m_handle_atr_h1     = iATR(_Symbol, PERIOD_H1, 14);
 
    if(m_handle_ma_fast_h1==INVALID_HANDLE ||
@@ -246,7 +244,7 @@ void CRegimeEngine::Init()
       m_handle_adx_h1    ==INVALID_HANDLE ||
       m_handle_atr_h1    ==INVALID_HANDLE)
      {
-      // いずれかのハンドル生成に失敗した場合はエラーログを出しておく
+      // いずれかのハンドル生成に失敗した場合はエラーログを出す
       LogPrint("ERROR", "REGIME", "CRegimeEngine::Init: H1 インジケータハンドルの作成に失敗しました。");
      }
    else
@@ -267,10 +265,10 @@ void CRegimeEngine::Reset()
 //--- H1新バー時に呼び出し（レジーム更新）
 void CRegimeEngine::OnNewBarH1()
   {
-   // H1 の新しいバーが確定したタイミングでレジーム判定を行う
-   // ここでは「確定バー（shift=1）」の値を使用して、過去データだけで判定する。
+   // H1 の新バー確定タイミングでレジーム判定を行う。
+   // 仕様どおり「確定バー（shift=1）」の値のみを使い、未確定バーは一切見ない。
 
-   // インジケータハンドルが未初期化の場合は、安全のためレジーム更新を行わない
+   // インジケータハンドルが未初期化の場合は安全側に倒してスキップ
    if(m_handle_ma_fast_h1==INVALID_HANDLE ||
       m_handle_ma_slow_h1==INVALID_HANDLE ||
       m_handle_adx_h1    ==INVALID_HANDLE ||
@@ -296,13 +294,13 @@ void CRegimeEngine::OnNewBarH1()
      }
 
    double ma_diff = ma_fast[0] - ma_slow[0];  // トレンド方向と強さを見るための MA 差
-   double atr     = atr_val[0];              // 正規化用の ATR（H1）
+   double atr     = atr_val[0];              // H1 ATR
    double adx     = adx_val[0];              // トレンドの強さ
 
    if(atr <= 0.0)
      {
       // ATR が 0 付近だと比率計算が不安定になるため、その場合は更新を見送る
-      LogPrint("WARN", "REGIME", "OnNewBarH1: ATR_H1 が 0 もしくは負のためレジーム更新をスキップします。");
+      LogPrint("WARN", "REGIME", "OnNewBarH1: ATR_H1 が 0 以下のためレジーム更新をスキップします。");
       return;
      }
 
@@ -311,31 +309,31 @@ void CRegimeEngine::OnNewBarH1()
    int    new_regime    = m_regime;
    double new_trend_dir = 0.0;
 
-   //--- トレンド判定
+   //--- トレンド判定：ADX がそこそこ強く、MA差もATRに対して十分大きい
    if(adx >= InpTrend_ADX_Min && ma_diff_atr_ratio >= InpTrend_MA_ATR_DiffMin)
      {
       new_regime    = REGIME_TREND;
       new_trend_dir = (ma_diff > 0.0 ? 1.0 : -1.0); // MA_fast > MA_slow なら上昇トレンド、逆なら下降トレンド
      }
-   //--- レンジ判定
+   //--- レンジ判定：ADX が弱く、MA差もATRに対して小さい
    else if(adx <= InpRange_ADX_Max && ma_diff_atr_ratio <= InpRange_MA_ATR_DiffMax)
      {
       new_regime    = REGIME_RANGE;
-      new_trend_dir = 0.0; // レンジ中は方向性 0 として扱う
+      new_trend_dir = 0.0; // レンジ中は方向性 0
      }
-   //--- それ以外はカオス（急変動や移行期など）
+   //--- それ以外はカオス（移行期や急変動など）
    else
      {
       new_regime    = REGIME_CHAOS;
       new_trend_dir = 0.0;
      }
 
-   // レジームまたはトレンド方向に変化があった場合のみ内部状態を更新
+   // レジーム or トレンド方向に変化があった場合だけ更新＋ログ
    if(new_regime != m_regime || new_trend_dir != m_trend_dir)
      {
       m_regime           = new_regime;
       m_trend_dir        = new_trend_dir;
-      m_last_change_time = TimeCurrent();
+      m_last_change_time = TimeCurrent(); // 実際には H1 バーの確定時間でも良いが、ここでは現在時刻で代用
 
       string regime_name = "UNKNOWN";
       if(m_regime == REGIME_TREND)
@@ -361,25 +359,27 @@ void CRegimeEngine::OnNewBarH1()
 //--- レジーム変更直後のクールダウン中かどうか
 bool CRegimeEngine::InCooldown() const
   {
-   // レジーム変更直後にエントリを控えるためのクールダウン判定
+   // レジーム変更直後にエントリを控えるためのクールダウン判定。
    // 「最後にレジームが変化した H1 バー」から何本経過したかで判断する。
    if(m_last_change_time==0)
       return(false);
 
-   // クールダウンバー数が 0 以下ならクールダウン機能自体を無効化
+   // クールダウンバー数が 0 以下ならクールダウン無効
    if(InpRegimeCooldownBars_H1 <= 0)
       return(false);
 
-   // iBarShift を使って、現在の H1 バーとレジーム変更時のバーのインデックス差を求める
+   // iBarShift を使い、レジーム変更時刻と現在時刻に対応する H1 バーのインデックス差を取る
    int shift_change = iBarShift(_Symbol, PERIOD_H1, m_last_change_time, true);
    int shift_now    = iBarShift(_Symbol, PERIOD_H1, TimeCurrent(),      true);
 
    if(shift_change < 0 || shift_now < 0)
       return(false);
 
-   int bars_diff = shift_change - shift_now; // 値が小さいほど最近のバー
+   // shift は「0 が最新バー」で、数字が大きいほど過去になる。
+   // 例: 直近バー=0, 1本前=1 ...
+   int bars_diff = shift_change - shift_now; // レジーム変更バーから何本経過したか
 
-   // 直近 InpRegimeCooldownBars_H1 本の間はクールダウン中とみなす
+   // 直近 InpRegimeCooldownBars_H1 本の間はクールダウン扱い
    if(bars_diff < InpRegimeCooldownBars_H1)
       return(true);
 
@@ -515,46 +515,22 @@ bool CGlobalGate::CanOpen()
   {
    //================================================================
    // 0) Spread/ATR ログ間引き用の static 変数
-   //    - last_spread_atr_block:
-   //        直近の判定で「Spread/ATR が NG だった状態かどうか」
-   //    - last_spread_atr_log_time:
-   //        最後に NG ログを出した時刻
-   //    - これにより、Spread/ATR NG が連続している間は
-   //      「状態が変わった瞬間 ＋ 一定秒数ごと」にしかログを出さない
    //================================================================
-   static bool     last_spread_atr_block    = false;
-   static datetime last_spread_atr_log_time = 0;
-   const  int      SPREAD_ATR_LOG_INTERVAL_SEC = 60;   // Spread/ATR NG ログを出す最小間隔（秒）
-
-   //================================================================
-   // 0-2) Spread/ATR 以外のログ間引き用 static 変数
-   //    - 理由が同じログが短時間に連続しないように、最後のログ理由と
-   //      出力時刻を記録し、一定秒数を下回る場合は出力を抑制する
-   //================================================================
-   static datetime last_gate_log_time    = 0;
-   static string   last_gate_log_reason  = "";
-   const  int      GATE_LOG_INTERVAL_SEC = 60;   // CanOpen 内の一般ログを出す最小間隔（秒）
+   static bool     last_spread_atr_block    = false; // 直近判定で Spread/ATR が NG だったか
+   static datetime last_spread_atr_log_time = 0;     // 最後に NG ログを出した時刻
+   const  int      SPREAD_ATR_LOG_INTERVAL_SEC = 60; // NG 継続中にログを出す最小間隔[秒]
 
    //================================================================
    // 1) モジュールのアタッチ状態チェック
-   //    - RegimeEngine / StateTracker が正しくセットされていない場合は
-   //      システム異常とみなし、安全側（新規エントリ禁止）に倒す
    //================================================================
    if(m_regime_engine == NULL || m_state_tracker == NULL)
      {
-      // ログ理由を明示しつつ、直近出力から一定秒数未満なら間引く
-      string reason = "Regime/State 未アタッチ";
-      if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
-        {
-         LogPrint("ERROR", "GATE", "CanOpen: RegimeEngine または StateTracker が未アタッチです。");
-        }
+      LogPrint("ERROR", "GATE", "CanOpen: RegimeEngine または StateTracker が未アタッチです。");
       return(false);
      }
 
    //================================================================
    // 2) 取引時間帯フィルタ
-   //    - InpTradeStartHour ～ InpTradeEndHour の間だけ新規エントリを許可
-   //    - 終了時刻 < 開始時刻 の場合は「日またぎ」（例: 16～3 時）として扱う
    //================================================================
    MqlDateTime mt;
    TimeToStruct(TimeCurrent(), mt);
@@ -563,17 +539,17 @@ bool CGlobalGate::CanOpen()
    bool time_ok = false;
    if(InpTradeStartHour == InpTradeEndHour)
      {
-      // 同じ値の場合は「24時間許可」として扱う
+      // 同じ値の場合は「24時間許可」
       time_ok = true;
      }
    else if(InpTradeStartHour < InpTradeEndHour)
      {
-      // 同一日内で完結する時間帯
+      // 同一日内に収まるパターン
       time_ok = (hour >= InpTradeStartHour && hour < InpTradeEndHour);
      }
    else
      {
-      // 日またぎ時間帯（例: 16～3 時）
+      // 日またぎパターン（例: 16～3 時）
       time_ok = (hour >= InpTradeStartHour || hour < InpTradeEndHour);
      }
 
@@ -582,101 +558,72 @@ bool CGlobalGate::CanOpen()
 
    //================================================================
    // 3) 日次 / 週次ドローダウンチェック
-   //    - CStateTracker が保持している日次 / 週次 DD（JPY建て）を
-   //      現在残高に対するパーセンテージに変換し、閾値と比較する
    //================================================================
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(balance > 0.0)
      {
-      // MQL5 ではクラスポインタであってもメンバアクセスは「.」で行うため
-      // 「->」を使用するとコンパイル時に演算子エラーとなる。必ず「.」を使って
-      // メソッドを呼び出すことで、MathAbs への引数が適切な double 型となる。
-      double daily_dd_pct  = 100.0 * MathAbs(m_state_tracker.DailyDD())  / balance;
-      double weekly_dd_pct = 100.0 * MathAbs(m_state_tracker.WeeklyDD()) / balance;
+      double daily_dd_pct  = 100.0 * MathAbs(m_state_tracker->DailyDD())  / balance;
+      double weekly_dd_pct = 100.0 * MathAbs(m_state_tracker->WeeklyDD()) / balance;
 
       if(daily_dd_pct >= InpMaxDailyDD || weekly_dd_pct >= InpMaxWeeklyDD)
         {
-         // 最大許容 DD を超えた場合は、新規エントリを停止
-         string reason = "DD 超過";
-         if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
-           {
-            LogPrint("WARN", "GATE",
-                     StringFormat("CanOpen: DD 超過によりエントリ禁止 (DailyDD=%.2f%%, WeeklyDD=%.2f%%)",
-                                  daily_dd_pct, weekly_dd_pct));
-           }
+         LogPrint("WARN", "GATE",
+                  StringFormat("CanOpen: DD 超過によりエントリ禁止 (DailyDD=%.2f%%, WeeklyDD=%.2f%%)",
+                               daily_dd_pct, weekly_dd_pct));
          return(false);
         }
      }
 
    //================================================================
    // 4) スプレッド / ATR_M1 チェック
-   //    4-1) 絶対スプレッド (pips) の上限チェック
-   //    4-2) Spread(pips) / ATR_M1(pips) の比率チェック（ログ間引き付き）
    //================================================================
    long spread_points = 0;
    if(!SymbolInfoInteger(_Symbol, SYMBOL_SPREAD, spread_points))
      {
-      // スプレッド情報が取得できないのは異常なので、安全のためエントリ禁止
-      string reason = "SYMBOL_SPREAD取得失敗";
-      if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
-        {
-         LogPrint("ERROR", "GATE", "CanOpen: SYMBOL_SPREAD が取得できません。");
-        }
+      LogPrint("ERROR", "GATE", "CanOpen: SYMBOL_SPREAD が取得できません。");
       return(false);
      }
 
    double point    = _Point;
-   // USDJPY など 3桁 / 5桁の場合は「Point × 10」が 1pip
-   // それ以外は「Point」が 1pip とみなす
-   double pip_size = (_Digits == 3 || _Digits == 5) ? (10.0 * point) : point;
+   double pip_size = (_Digits == 3 || _Digits == 5) ? (10.0 * point) : point; // 3/5桁は Point×10 が1pip
    double spread_pips = (double)spread_points * point / pip_size;
 
    if(spread_pips <= 0.0)
      {
-      // スプレッドが 0 以下は通常あり得ないので、一旦エントリを控える
-      string reason = "スプレッド異常(<=0)";
-      if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
-        {
-         LogPrint("WARN", "GATE", "CanOpen: スプレッドが 0 以下のためエントリをスキップします。");
-        }
+      LogPrint("WARN", "GATE", "CanOpen: スプレッドが 0 以下のためエントリをスキップします。");
       return(false);
      }
 
-   //--- 絶対スプレッドの上限チェック
+   // 絶対スプレッド上限
    if(spread_pips > InpMaxSpreadPips)
      {
-      string reason = "スプレッド上限超過";
-      if(ShouldLogCanOpenNonATR(reason, last_gate_log_time, last_gate_log_reason, GATE_LOG_INTERVAL_SEC))
-        {
-         LogPrint("INFO", "GATE",
-                  StringFormat("CanOpen: スプレッドが上限を超過 (Spread=%.2f pips, Max=%.2f pips)",
-                               spread_pips, InpMaxSpreadPips));
-        }
+      LogPrint("INFO", "GATE",
+               StringFormat("CanOpen: スプレッドが上限を超過 (Spread=%.2f pips, Max=%.2f pips)",
+                            spread_pips, InpMaxSpreadPips));
       return(false);
      }
 
-   //--- ATR_M1 を使った相対スプレッド比チェック
+   // Spread / ATR_M1 比チェック
    if(InpMaxSpreadATRRatio > 0.0 && g_handle_atr_m1 != INVALID_HANDLE)
      {
       double atr_buf[1];
       if(CopyBuffer(g_handle_atr_m1, 0, 1, 1, atr_buf) == 1)
         {
-         double atr_m1      = atr_buf[0];                    // 価格単位 (例: 0.0115)
-         double atr_m1_pips = (atr_m1 > 0.0 ? atr_m1 / pip_size : 0.0); // pips に換算
+         double atr_m1      = atr_buf[0];                    // 価格単位
+         double atr_m1_pips = (atr_m1 > 0.0 ? atr_m1 / pip_size : 0.0);
 
          if(atr_m1_pips > 0.0)
            {
-            double ratio = spread_pips / atr_m1_pips;        // Spread(pips) / ATR_M1(pips)
+            double ratio = spread_pips / atr_m1_pips;
 
             if(ratio > InpMaxSpreadATRRatio)
               {
-               // 今回の判定では Spread/ATR が NG
                bool should_log = false;
 
-               // 1) 状態が「OK → NG」に変化した最初のタイミングでは必ずログを出す
+               // 状態が OK→NG に変わった瞬間は必ずログ
                if(!last_spread_atr_block)
                   should_log = true;
-               // 2) すでに NG 状態が継続している場合は、一定秒数ごとにだけログを出す
+               // NG 継続中は一定秒数ごとにだけログ
                else if(TimeCurrent() - last_spread_atr_log_time >= SPREAD_ATR_LOG_INTERVAL_SEC)
                   should_log = true;
 
@@ -688,21 +635,18 @@ bool CGlobalGate::CanOpen()
                   last_spread_atr_log_time = TimeCurrent();
                  }
 
-               // NG 状態フラグをセットし、このティックでは新規エントリ禁止
                last_spread_atr_block = true;
                return(false);
               }
             else
               {
-               // 今回の判定では Spread/ATR は OK
-               // 直前まで NG 状態だった場合、閾値内に復帰したことを 1 回だけログ出力する
+               // 今回は Spread/ATR OK。直前までNGだったなら復帰ログを一回だけ出す
                if(last_spread_atr_block)
                  {
                   LogPrint("INFO", "GATE",
                            StringFormat("CanOpen: Spread/ATR 比が閾値内に復帰 (Spread=%.2f pips, ATR_M1=%.2f pips, Ratio=%.2f, Max=%.2f)",
                                         spread_pips, atr_m1_pips, ratio, InpMaxSpreadATRRatio));
                  }
-               // 状態フラグを OK 側に戻す
                last_spread_atr_block = false;
               }
            }
@@ -710,25 +654,20 @@ bool CGlobalGate::CanOpen()
      }
 
    //================================================================
-   // 5) レジーム変更直後のクールダウン
-   //    - レジームが変化してから InpRegimeCooldownBars_H1 本の間は
-   //      相場が落ち着くまで新規エントリを控える
+   // 5) レジームクールダウン
    //================================================================
-   // ポインタ経由アクセス時も「.」を用い、クールダウン中であれば安全側でエントリ禁止
-   if(m_regime_engine.InCooldown())
+   if(m_regime_engine->InCooldown())
      {
       return(false);
      }
 
    //================================================================
-   // 6) ニュースフィルタ
-   //    - Phase1 ではまだニュース連携を実装しない
-   //    - フラグが ON でも挙動は変えず、将来の拡張ポイントとして残す
+   // 6) ニュースフィルタ（まだダミー）
    //================================================================
    if(InpUseNewsFilter)
      {
-      // TODO: ニュース時間帯の取得ロジックを実装する
-      // 現時点では挙動を変えない（ログも控えめにするため何も出さない）
+      // TODO: ニュース時間帯の取得ロジックをここに実装
+      // 現時点では挙動を変えない（ログも控える）
      }
 
    //================================================================
@@ -952,12 +891,12 @@ int OnInit()
   {
    LogPrint("INFO", "INIT", "RAIN_Delta_EA_Phase1 OnInit start");
 
-   //--- M1 ATR インジケータハンドルを生成（スプレッド/ATR 比フィルタ用）
+   //--- M1 ATR インジケータハンドルを生成（Spread/ATR フィルタ用）
    //     ここでは period=14 の ATR を使用し、確定バーのボラティリティとして参照する。
    g_handle_atr_m1 = iATR(_Symbol, PERIOD_M1, 14);
    if(g_handle_atr_m1 == INVALID_HANDLE)
      {
-      LogPrint("ERROR", "INIT", "M1 ATR ハンドルの作成に失敗しました。スプレッド/ATR フィルタは無効になります。");
+      LogPrint("ERROR", "INIT", "M1 ATR ハンドルの作成に失敗しました。Spread/ATR フィルタは無効になります。");
      }
    else
      {
@@ -965,10 +904,9 @@ int OnInit()
      }
 
    //--- 各モジュール初期化
-    g_regime.Init();
-    g_state.Init();
-    //--- 参照経由で安全にアタッチ（& を呼び出し側で付けないことで、誤用を防止）
-    g_gate.Attach(g_regime, g_state);
+   g_regime.Init();
+   g_state.Init();
+   g_gate.Attach(&g_regime, &g_state);
 
    g_alpha_a.Init();
    g_alpha_b.Init();
@@ -979,6 +917,7 @@ int OnInit()
    LogPrint("INFO", "INIT", "OnInit completed");
    return(INIT_SUCCEEDED);
   }
+
 
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
