@@ -49,8 +49,8 @@ input int    InpRegimeCooldownBars_H1 = 3;
 
 //--- AlphaA: 圧縮ブレイク
 input int    InpA_Lookback_M5       = 12;
-input double InpA_Range_ATR_Ratio_Max = 0.8;
-input double InpA_InsideRateMin     = 0.5;
+input double InpA_Range_ATR_Ratio_Max = 2.3;
+input double InpA_InsideRateMin     = 0.27;
 input double InpA_EntryOffsetATR    = 0.25;
 input double InpA_SL_ATR            = 1.3;
 input double InpA_TP1_ATR           = 1.5;
@@ -236,7 +236,9 @@ void CRegimeEngine::Init()
    // - ATR でボラティリティを取得し、MA差との比率を計算する
    m_handle_ma_fast_h1 = iMA(_Symbol, PERIOD_H1, InpH1_MA_Fast, 0, MODE_EMA, PRICE_CLOSE);
    m_handle_ma_slow_h1 = iMA(_Symbol, PERIOD_H1, InpH1_MA_Slow, 0, MODE_EMA, PRICE_CLOSE);
-   m_handle_adx_h1     = iADX(_Symbol, PERIOD_H1, InpH1_ADX_Period, PRICE_CLOSE);
+   // ADX は MQL5 でシンボル・時間足・期間のみを受け取るため、余分な引数は渡さない
+   // （PRICE_CLOSE を指定するとパラメータ数不一致でコンパイルエラーになる）
+   m_handle_adx_h1     = iADX(_Symbol, PERIOD_H1, InpH1_ADX_Period);
    m_handle_atr_h1     = iATR(_Symbol, PERIOD_H1, 14);
 
    if(m_handle_ma_fast_h1==INVALID_HANDLE ||
@@ -528,6 +530,13 @@ bool CGlobalGate::CanOpen()
       LogPrint("ERROR", "GATE", "CanOpen: RegimeEngine または StateTracker が未アタッチです。");
       return(false);
      }
+    //--- 上記で null チェックを終えたので、以降はポインタをローカルへキャッシュする
+    //    ・MQL5 ではローカル変数への参照型束縛がサポートされておらず、& を使うと
+    //      「reference cannot used」のコンパイルエラーになるため、素直にポインタで扱う
+    //    ・state という名前が他の識別子と紛らわしくならないよう、末尾に _ptr を付けて
+    //      「ポインタである」ことを明示し、後続の利用箇所で型推論の誤解を避ける
+    CRegimeEngine *regime_ptr = m_regime_engine;
+    CStateTracker *state_ptr  = m_state_tracker;
 
    //================================================================
    // 2) 取引時間帯フィルタ
@@ -559,20 +568,33 @@ bool CGlobalGate::CanOpen()
    //================================================================
    // 3) 日次 / 週次ドローダウンチェック
    //================================================================
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   if(balance > 0.0)
-     {
-      double daily_dd_pct  = 100.0 * MathAbs(m_state_tracker->DailyDD())  / balance;
-      double weekly_dd_pct = 100.0 * MathAbs(m_state_tracker->WeeklyDD()) / balance;
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    if(balance > 0.0)
+      {
+       //--- 現在の DD を一旦 JPY ベースで取り出し、型が曖昧にならないよう明示的な一時変数で保持
+       //    （ポインタ経由の戻り値を直接 MathAbs に渡すと、メタエディタの解析で
+       //     「ポインタを数値に変換できない」と誤解されることがあるため、
+       //     手順を分解して可読性と安全性を上げる）
+       //    ポインタのままでは "->" が続き読みにくいので、上で短縮名にしたポインタを
+       //    介してシンプルに呼び出す（null チェック済みなので即時呼び出しで安全）
+       // MQL5 ではクラスポインタ経由でも "." でメソッドを呼び出す（"->" はサポート外）ため、
+       // ここではポインタ名をそのまま用いて DailyDD / WeeklyDD を取得する。
+       double daily_dd_jpy  = state_ptr.DailyDD();
+       double weekly_dd_jpy = state_ptr.WeeklyDD();
 
-      if(daily_dd_pct >= InpMaxDailyDD || weekly_dd_pct >= InpMaxWeeklyDD)
-        {
-         LogPrint("WARN", "GATE",
-                  StringFormat("CanOpen: DD 超過によりエントリ禁止 (DailyDD=%.2f%%, WeeklyDD=%.2f%%)",
-                               daily_dd_pct, weekly_dd_pct));
-         return(false);
-        }
-     }
+       //--- 口座残高に対する割合（%）を算出
+       double daily_dd_pct  = 100.0 * MathAbs(daily_dd_jpy)  / balance;
+       double weekly_dd_pct = 100.0 * MathAbs(weekly_dd_jpy) / balance;
+
+       //--- 閾値超過なら即座にエントリを禁止し、具体的な比率をログ出力
+       if(daily_dd_pct >= InpMaxDailyDD || weekly_dd_pct >= InpMaxWeeklyDD)
+         {
+          LogPrint("WARN", "GATE",
+                   StringFormat("CanOpen: DD 超過によりエントリ禁止 (DailyDD=%.2f%%, WeeklyDD=%.2f%%)",
+                                daily_dd_pct, weekly_dd_pct));
+          return(false);
+         }
+      }
 
    //================================================================
    // 4) スプレッド / ATR_M1 チェック
@@ -597,9 +619,9 @@ bool CGlobalGate::CanOpen()
    // 絶対スプレッド上限
    if(spread_pips > InpMaxSpreadPips)
      {
-      LogPrint("INFO", "GATE",
-               StringFormat("CanOpen: スプレッドが上限を超過 (Spread=%.2f pips, Max=%.2f pips)",
-                            spread_pips, InpMaxSpreadPips));
+      //LogPrint("INFO", "GATE",
+      //         StringFormat("CanOpen: スプレッドが上限を超過 (Spread=%.2f pips, Max=%.2f pips)",
+      //                      spread_pips, InpMaxSpreadPips));
       return(false);
      }
 
@@ -627,13 +649,18 @@ bool CGlobalGate::CanOpen()
                else if(TimeCurrent() - last_spread_atr_log_time >= SPREAD_ATR_LOG_INTERVAL_SEC)
                   should_log = true;
 
-               if(should_log)
-                 {
-                  LogPrint("INFO", "GATE",
-                           StringFormat("CanOpen: Spread/ATR 比が上限を超過 (Spread=%.2f pips, ATR_M1=%.2f pips, Ratio=%.2f, Max=%.2f)",
-                                        spread_pips, atr_m1_pips, ratio, InpMaxSpreadATRRatio));
-                  last_spread_atr_log_time = TimeCurrent();
-                 }
+                 if(should_log)
+                   {
+                    // ロングメッセージが複数行にまたがってシンタックスエラーにならないよう、1 行で整形する
+                    LogPrint("INFO", "GATE",
+                             StringFormat("CanOpen: Spread/ATR 比が上限を超過 (Spread=%.2f pips, ATR_M1=%.2f pips, Ratio=%.2f, Max=%.2f)",
+                                          spread_pips, atr_m1_pips, ratio, InpMaxSpreadATRRatio));
+                    LogPrint("INFO", "TEST",
+                              StringFormat("spread_points=%ld, pip_size=%.5f, spread_pips=%.3f, ATR_M1=%.5f, ATR_M1_pips=%.3f, ratio=%.3f, Max=%.3f",
+                                          spread_points, pip_size, spread_pips, atr_m1, atr_m1_pips, ratio, InpMaxSpreadATRRatio));
+
+                    last_spread_atr_log_time = TimeCurrent();
+                   }
 
                last_spread_atr_block = true;
                return(false);
@@ -656,7 +683,10 @@ bool CGlobalGate::CanOpen()
    //================================================================
    // 5) レジームクールダウン
    //================================================================
-   if(m_regime_engine->InCooldown())
+   //--- レジームエンジンのクールダウン状態を確認
+   //    ポインタ経由で呼び出すことで、参照束縛禁止によるコンパイルエラーを回避
+   // MQL5 のポインタ呼び出しは "." を用いる点に注意（"->" ではコンパイル不可）。
+    if(regime_ptr.InCooldown())
      {
       return(false);
      }
@@ -683,40 +713,276 @@ bool CGlobalGate::CanOpen()
 
 //--------------------------------------------------------------
 // CAlphaA : 圧縮ブレイク順張り
+//  - H1 がトレンド状態のときのみエントリ
+//  - M5 の一定本数が「狭いレンジ＋インサイドバー多め」なら圧縮とみなす
+//  - 圧縮状態から抜けたタイミングで、トレンド方向へブレイクしたらエントリ
 //--------------------------------------------------------------
 class CAlphaA
   {
 private:
-   int      m_magic;
+   int         m_magic;              // このアルファ専用のマジック番号
+
+   // M5 ATR 用ハンドル
+   int         m_handle_atr_m5;
+   double      m_last_atr_m5;
+
+   // 圧縮状態の管理
+   bool        m_in_compression;     // 直近が圧縮状態かどうか
+   double      m_range_high;         // 圧縮レンジの高値
+   double      m_range_low;          // 圧縮レンジの安値
+
+   // シグナルの一時保管（OnNewBarM5 で作って GetSignal で受け取る）
+   bool        m_has_pending_signal;
+   TradeSignal m_pending_signal;
+
 public:
                      CAlphaA(int magic_base);
    void              Init();
-   void              OnNewBarM5();                 // M5新バー時に状態更新
-   bool              GetSignal(TradeSignal &sig);  // シグナル生成
+   void              OnNewBarM5();                 // M5新バー時に状態更新＆シグナル生成
+   bool              GetSignal(TradeSignal &sig);  // 保留シグナルを1回だけ返す
   };
 
 CAlphaA::CAlphaA(int magic_base)
   {
-   m_magic = magic_base + 1; // AlphaA用のマジック番号
+   m_magic             = magic_base + 1; // AlphaA用のマジック番号
+   m_handle_atr_m5     = INVALID_HANDLE;
+   m_last_atr_m5       = 0.0;
+   m_in_compression    = false;
+   m_range_high        = 0.0;
+   m_range_low         = 0.0;
+   m_has_pending_signal = false;
+   ZeroMemory(m_pending_signal);
   }
 
 void CAlphaA::Init()
   {
-   // TODO: 必要なバッファ初期化など
-   LogPrint("INFO", "ALPHA_A", "Init called");
+   // M5 ATR ハンドルを生成（圧縮判定・SL/TP距離計算に使う）
+   m_handle_atr_m5 = iATR(_Symbol, PERIOD_M5, 14);
+   if(m_handle_atr_m5 == INVALID_HANDLE)
+     {
+      LogPrint("ERROR", "ALPHA_A", "Init: M5 ATR ハンドル作成に失敗しました。");
+     }
+   else
+     {
+      LogPrint("INFO", "ALPHA_A", "Init: M5 ATR ハンドル作成完了。");
+     }
   }
 
 void CAlphaA::OnNewBarM5()
   {
-   // TODO: 圧縮状態の検出ロジックをここに実装
+   //--- 必要な履歴が足りなければ何もしない
+   int lookback = InpA_Lookback_M5;
+   if(lookback <= 2)
+      return;
+
+   int bars_m5 = Bars(_Symbol, PERIOD_M5);
+   if(bars_m5 <= lookback + 2) // 多少余裕を見ておく
+      return;
+
+   //--- ATR取得
+   if(m_handle_atr_m5 == INVALID_HANDLE)
+     {
+      LogPrint("WARN", "ALPHA_A", "OnNewBarM5: ATR_M5 ハンドル未初期化のため処理をスキップします。");
+      return;
+     }
+
+   double atr_buf[1];
+   if(CopyBuffer(m_handle_atr_m5, 0, 1, 1, atr_buf) != 1)
+     {
+      LogPrint("WARN", "ALPHA_A", "OnNewBarM5: ATR_M5 CopyBuffer に失敗しました。");
+      return;
+     }
+
+   double atr_m5 = atr_buf[0];
+   if(atr_m5 <= 0.0)
+      return;
+
+   // 前回値を控えておく（ブレイク判定で「直前ATR」を使うため）
+   double prev_atr        = m_last_atr_m5;
+   m_last_atr_m5          = atr_m5;
+   bool   was_compress    = m_in_compression;
+   double prev_range_high = m_range_high;
+   double prev_range_low  = m_range_low;
+
+   //--- 現在の lookback 本の高値・安値レンジを計算（shift=1 が確定済み最新バー）
+   double max_high = -DBL_MAX;
+   double min_low  =  DBL_MAX;
+
+   for(int shift = 1; shift <= lookback; ++shift)
+     {
+      double h = iHigh(_Symbol, PERIOD_M5, shift);
+      double l = iLow(_Symbol, PERIOD_M5, shift);
+      if(h == 0.0 && l == 0.0)
+         return; // データ不整合時は何もしない
+
+      if(h > max_high) max_high = h;
+      if(l < min_low)  min_low  = l;
+     }
+
+   double price_range = max_high - min_low;
+   if(price_range <= 0.0)
+     {
+      m_in_compression = false;
+      return;
+     }
+
+   double range_atr_ratio = price_range / atr_m5;
+
+   //--- インサイドバー率をざっくり測る
+   int inside_count   = 0;
+   int inside_samples = lookback - 1; // 前のバーと比較する本数
+
+   for(int shift = 1; shift <= lookback - 1; ++shift)
+     {
+      double h      = iHigh(_Symbol, PERIOD_M5, shift);
+      double l      = iLow(_Symbol, PERIOD_M5, shift);
+      double h_prev = iHigh(_Symbol, PERIOD_M5, shift + 1);
+      double l_prev = iLow(_Symbol, PERIOD_M5, shift + 1);
+
+      if(h <= h_prev && l >= l_prev)
+         inside_count++;
+     }
+
+   double inside_rate = 0.0;
+   if(inside_samples > 0)
+      inside_rate = (double)inside_count / (double)inside_samples;
+
+   //--- 現在のバー群が「圧縮状態」かどうか
+   bool now_compress = false;
+   if(range_atr_ratio <= InpA_Range_ATR_Ratio_Max &&
+      inside_rate     >= InpA_InsideRateMin)
+     {
+      now_compress = true;
+     }
+
+   // 圧縮状態を更新
+   m_in_compression = now_compress;
+   if(now_compress)
+     {
+      m_range_high = max_high;
+      m_range_low  = min_low;
+
+      // 新しく圧縮状態に入ったタイミングでログを 1 回だけ出す
+      if(!was_compress)
+        {
+         LogPrint("INFO", "ALPHA_A",
+                  StringFormat("Enter compression: range_atr_ratio=%.2f, inside_rate=%.2f, high=%.5f, low=%.5f, ATR_M5=%.5f, lookback=%d",
+                               range_atr_ratio, inside_rate, max_high, min_low, atr_m5, lookback));
+        }
+     }
+
+   // このバーでのブレイクアウト判定は、
+   // 「直前まで圧縮だったのに、今回の窓では圧縮条件を満たさなくなった」
+   if(!(was_compress && !now_compress))
+      return;
+
+   // ここに来た時点で「圧縮 → 非圧縮」への遷移が起きている
+   // → ブレイク候補として詳細ログを出す
+   LogPrint("INFO", "ALPHA_A",
+            StringFormat("Leave compression: prev_high=%.5f, prev_low=%.5f, range_atr_ratio=%.2f, inside_rate=%.2f",
+                         prev_range_high, prev_range_low, range_atr_ratio, inside_rate));
+
+   //--- H1レジームがトレンド状態でない場合はエントリしない
+   int    regime    = g_regime.Regime();
+   double trend_dir = g_regime.TrendDir();
+   if(regime != REGIME_TREND || trend_dir == 0.0)
+     {
+      LogPrint("INFO", "ALPHA_A",
+               StringFormat("Skip breakout: Regime=%d, TrendDir=%.1f", regime, trend_dir));
+      return;
+     }
+
+   //--- ブレイク判定に使うのは直近確定M5バーの終値
+   double last_close = iClose(_Symbol, PERIOD_M5, 1);
+   if(last_close <= 0.0)
+      return;
+
+   //--- エントリ価格の目安には直近ATR（なければ今回のATR）を使う
+   double atr_for_entry = (prev_atr > 0.0 ? prev_atr : atr_m5);
+   if(atr_for_entry <= 0.0)
+      return;
+
+   double offset = InpA_EntryOffsetATR * atr_for_entry;
+
+   // デバッグ用：ブレイク条件チェックの時点の状況をログ
+   LogPrint("INFO", "ALPHA_A",
+            StringFormat("Breakout check: close=%.5f, prev_high=%.5f, prev_low=%.5f, offset=%.5f, ATR_entry=%.5f, trend_dir=%.1f",
+                         last_close, prev_range_high, prev_range_low, offset, atr_for_entry, trend_dir));
+
+   TradeSignal sig;
+   ZeroMemory(sig);
+   sig.is_valid = false;
+
+   // 上昇トレンドでボックス上抜け
+   if(trend_dir > 0.0 && last_close > (prev_range_high + offset))
+     {
+      double entry = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(entry <= 0.0)
+         entry = last_close;
+
+      double sl = entry - InpA_SL_ATR * atr_for_entry;
+      double tp = entry + InpA_TP1_ATR * atr_for_entry;
+
+      sig.is_valid = true;
+      sig.side     = SIGNAL_BUY;
+      sig.price    = 0.0;     // 0.0 は「成行」を意味する（実際の価格はRiskManager側で取得）
+      sig.sl       = sl;
+      sig.tp       = tp;
+      sig.magic    = m_magic;
+      sig.comment  = "A:BreakoutBuy";
+     }
+   // 下降トレンドでボックス下抜け
+   else if(trend_dir < 0.0 && last_close < (prev_range_low - offset))
+     {
+      double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(entry <= 0.0)
+         entry = last_close;
+
+      double sl = entry + InpA_SL_ATR * atr_for_entry;
+      double tp = entry - InpA_TP1_ATR * atr_for_entry;
+
+      sig.is_valid = true;
+      sig.side     = SIGNAL_SELL;
+      sig.price    = 0.0;     // 成行
+      sig.sl       = sl;
+      sig.tp       = tp;
+      sig.magic    = m_magic;
+      sig.comment  = "A:BreakoutSell";
+     }
+   else
+     {
+      // 圧縮は解けたが、トレンド方向にブレイクしなかった場合
+      LogPrint("INFO", "ALPHA_A",
+               "Compression ended but no trend-direction breakout (conditions not met).");
+     }
+
+   if(sig.is_valid)
+     {
+      m_pending_signal     = sig;
+      m_has_pending_signal = true;
+
+      LogPrint("INFO", "ALPHA_A",
+               StringFormat("Breakout signal: side=%s, close=%.5f, SL=%.5f, TP=%.5f, ATR_M5=%.5f",
+                            (sig.side == SIGNAL_BUY ? "BUY" : "SELL"),
+                            last_close, sig.sl, sig.tp, atr_for_entry));
+     }
   }
+
 
 bool CAlphaA::GetSignal(TradeSignal &sig)
   {
-   // TODO: 条件を満たした場合に sig を埋めて true を返す
-   sig.is_valid = false;
-   return(false);
+   // OnNewBarM5 で作ったシグナルを 1 回だけ返す
+   if(!m_has_pending_signal)
+     {
+      sig.is_valid = false;
+      return(false);
+     }
+
+   sig = m_pending_signal; // 構造体コピー
+   m_has_pending_signal = false;
+   return(true);
   }
+
 
 //--------------------------------------------------------------
 // CAlphaB : AVWAP回帰逆張り
@@ -814,38 +1080,196 @@ void CRiskManager::Init()
    LogPrint("INFO", "RISK", "Init called");
   }
 
-//--- リスク[%]とSL幅[pips]からロットを計算（簡易版・骨格）
+//--- リスク[%]とSL幅[pips]からロットを計算（本実装）
+//    - 口座残高 × InpRiskPerTrade[%] = 許容損失額
+//    - TickValue / TickSize から「1ロットあたり1pipの金額」を求める
+//    - SL[pips] × 1pipあたり金額 ＝ 1ロットあたり損失額
+//    - 許容損失額 / 1ロット損失額 ＝ ロット数
 double CRiskManager::CalcLotByRisk(double sl_pips)
   {
    if(sl_pips <= 0.0)
       return(0.0);
 
-   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance <= 0.0)
+      return(0.0);
+
    double risk_amt = balance * InpRiskPerTrade / 100.0;
 
-   // pips -> 損失通貨額への換算はブローカー仕様によって異なる
-   // Phase1骨格では簡易に「1pipsあたり一定金額」と仮定して雑に割る
-   // TODO: 実装時に TickValue などを用いて正確に計算する
-   double pip_value = 10.0; // ダミー値
-   double lots      = risk_amt / (sl_pips * pip_value);
-   if(lots < 0.0)
-      lots = 0.0;
+   double tick_size   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tick_value  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double volume_min  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double volume_max  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volume_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   double point    = _Point;
+   double pip_size = (_Digits == 3 || _Digits == 5) ? (10.0 * point) : point;
+
+   if(tick_size <= 0.0 || tick_value <= 0.0 || pip_size <= 0.0 || volume_step <= 0.0)
+      return(0.0);
+
+   // 1ロットあたり1pipの金額
+   double pip_value_1lot = tick_value * (pip_size / tick_size);
+   if(pip_value_1lot <= 0.0)
+      return(0.0);
+
+   double loss_per_lot = sl_pips * pip_value_1lot;
+   if(loss_per_lot <= 0.0)
+      return(0.0);
+
+   double lots = risk_amt / loss_per_lot;
+
+   //--- ブローカーの制約に合わせてクリップ＆ステップ補正
+   if(volume_min > 0.0 && lots < volume_min)
+      lots = volume_min;
+   if(volume_max > 0.0 && lots > volume_max)
+      lots = volume_max;
+
+   lots = MathFloor(lots / volume_step) * volume_step;
+   if(lots < volume_min)
+      return(0.0);
 
    return(lots);
   }
 
-//--- 各Alphaのシグナルを受け取り、どれを実行するか決めて注文発行（骨格）
+
+//--- 各Alphaのシグナルを受け取り、どれを実行するか決めて注文発行
+//    Phase1では優先順位：A > B > C で、1つだけ実行。
+//    かつ、このEA（MagicBase+1〜3）のポジションが既にある場合は新規エントリしない。
 bool CRiskManager::Execute(TradeSignal &sig_a,
                            TradeSignal &sig_b,
                            TradeSignal &sig_c)
   {
-   // TODO:
-   // 1) レジームと整合するシグナルを優先
-   // 2) 期待RやTP距離 / Spread 比などで優先度を決める
-   // 3) 選ばれたシグナルに対して Lot を計算し、CTradeで注文
-   // Phase1では何もしない
-   return(false);
+   //================================================================
+   // 1) シグナル選択（優先順位：A > B > C）
+   //================================================================
+   TradeSignal sig;
+   ZeroMemory(sig);
+   sig.is_valid = false;
+
+   if(sig_a.is_valid)
+      sig = sig_a;
+   else if(sig_b.is_valid)
+      sig = sig_b;
+   else if(sig_c.is_valid)
+      sig = sig_c;
+   else
+      return(false); // シグナルが何もなければ何もしない
+
+   //================================================================
+   // 2) このEAのポジションが既にある場合は新規エントリ禁止
+   //    - Magic: InpMagicBase+1 ～ InpMagicBase+3 をこのEAの範囲とみなす
+   //================================================================
+   int total = PositionsTotal();
+   for(int i = 0; i < total; ++i)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string sym   = PositionGetString(POSITION_SYMBOL);
+      long   magic = (long)PositionGetInteger(POSITION_MAGIC);
+
+      if(sym == _Symbol && magic >= InpMagicBase + 1 && magic <= InpMagicBase + 3)
+        {
+         // すでにこのEAのポジションがある → 新規エントリは見送る
+         return(false);
+        }
+     }
+
+   //================================================================
+   // 3) エントリー価格・SL/TP距離の計算
+   //================================================================
+   double point    = _Point;
+   double pip_size = (_Digits == 3 || _Digits == 5) ? (10.0 * point) : point;
+
+   double entry_price = 0.0;
+   if(sig.side == SIGNAL_BUY)
+      entry_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   else if(sig.side == SIGNAL_SELL)
+      entry_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   else
+      return(false);
+
+   if(entry_price <= 0.0)
+      return(false);
+
+   double sl_price = sig.sl;
+   double tp_price = sig.tp;
+
+   if(sl_price <= 0.0 || tp_price <= 0.0)
+      return(false);
+
+   double sl_pips = MathAbs(entry_price - sl_price) / pip_size;
+   double tp_pips = MathAbs(tp_price - entry_price) / pip_size;
+
+   if(sl_pips <= 0.0 || tp_pips <= 0.0)
+      return(false);
+
+   //================================================================
+   // 4) TP / Spread 比が低すぎるエントリはスキップ
+   //================================================================
+   long spread_points = 0;
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_SPREAD, spread_points))
+      return(false);
+
+   double spread_pips = (double)spread_points * point / pip_size;
+
+   if(spread_pips > 0.0)
+     {
+      double target_spread_ratio = tp_pips / spread_pips;
+      if(target_spread_ratio < InpMinTargetToSpreadRatio)
+        {
+         LogPrint("INFO", "RISK",
+                  StringFormat("Execute: TP/Spread 比が小さすぎるためエントリ見送り (TP=%.2f pips, Spread=%.2f pips, Ratio=%.2f, Min=%.2f)",
+                               tp_pips, spread_pips, target_spread_ratio, InpMinTargetToSpreadRatio));
+         return(false);
+        }
+     }
+
+   //================================================================
+   // 5) ロット計算
+   //================================================================
+   double lots = CalcLotByRisk(sl_pips);
+   if(lots <= 0.0)
+     {
+      LogPrint("WARN", "RISK",
+               StringFormat("Execute: CalcLotByRisk によりロット=%.2f のためエントリ見送り (SL=%.2f pips)",
+                            lots, sl_pips));
+      return(false);
+     }
+
+   //================================================================
+   // 6) 実際の注文発行
+   //================================================================
+   m_trade.SetExpertMagicNumber(sig.magic);
+
+   bool   result    = false;
+   string side_text = (sig.side == SIGNAL_BUY ? "BUY" : "SELL");
+
+   if(sig.side == SIGNAL_BUY)
+     {
+      result = m_trade.Buy(lots, _Symbol, 0.0, sl_price, tp_price, sig.comment);
+     }
+   else if(sig.side == SIGNAL_SELL)
+     {
+      result = m_trade.Sell(lots, _Symbol, 0.0, sl_price, tp_price, sig.comment);
+     }
+
+   if(!result)
+     {
+      int err = GetLastError();
+      LogPrint("ERROR", "RISK",
+               StringFormat("Execute: 注文失敗 side=%s lots=%.2f err=%d", side_text, lots, err));
+      return(false);
+     }
+
+   LogPrint("INFO", "RISK",
+            StringFormat("Execute: 注文成功 side=%s lots=%.2f SL=%.3f TP=%.3f",
+                         side_text, lots, sl_price, tp_price));
+   return(true);
   }
+
 
 //==================================================================
 // グローバルインスタンス
@@ -906,7 +1330,10 @@ int OnInit()
    //--- 各モジュール初期化
    g_regime.Init();
    g_state.Init();
-   g_gate.Attach(&g_regime, &g_state);
+
+   // Attach は参照受け取りなので、生ポインタではなくオブジェクトそのものを渡す
+   // （& を付けると CRegimeEngine* 型となりシグネチャ不一致でコンパイルエラーとなる）
+   g_gate.Attach(g_regime, g_state);
 
    g_alpha_a.Init();
    g_alpha_b.Init();
