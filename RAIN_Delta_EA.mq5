@@ -49,9 +49,9 @@ input int    InpRegimeCooldownBars_H1 = 3;
 
 //--- AlphaA: 圧縮ブレイク
 input int    InpA_Lookback_M5       = 12;
-input double InpA_Range_ATR_Ratio_Max = 2.3;
-input double InpA_InsideRateMin     = 0.27;
-input double InpA_EntryOffsetATR    = 0.25;
+input double InpA_Range_ATR_Ratio_Max = 2.4;
+input double InpA_InsideRateMin     = 0.15;
+input double InpA_EntryOffsetATR    = 0.15;
 input double InpA_SL_ATR            = 1.3;
 input double InpA_TP1_ATR           = 1.5;
 input double InpA_TP2_TrailATR      = 1.0;
